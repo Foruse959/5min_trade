@@ -227,6 +227,29 @@ async def main():
         await engine.bot.app.start()
         await engine.bot.app.updater.start_polling(drop_pending_updates=True)
         print("✅ Telegram bot is running!")
+
+        # Send startup notification to Telegram
+        if Config.TELEGRAM_CHAT_ID:
+            try:
+                stats = engine.risk_manager.get_stats()
+                mode = "PAPER" if Config.is_paper() else "LIVE"
+                msg = (
+                    f"🟢 *5MIN_TRADE is ONLINE*\n\n"
+                    f"Mode: {mode}\n"
+                    f"Balance: ${stats['balance']:.2f}\n"
+                    f"Tier: {stats.get('tier_emoji','')} {stats.get('tier','')}\n"
+                    f"Strategies: 9 loaded\n"
+                    f"Coins: {', '.join(Config.ENABLED_COINS)}\n\n"
+                    f"Type /trade to start trading!\n"
+                    f"Type /status to see positions."
+                )
+                await engine.bot.app.bot.send_message(
+                    chat_id=Config.TELEGRAM_CHAT_ID,
+                    text=msg,
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                print(f"⚠️ Couldn't send startup msg: {e}")
     else:
         print("⚠️ No Telegram — auto-starting trading loop...")
         await engine.start()
