@@ -222,11 +222,32 @@ async def main():
 
     # Run telegram bot
     if engine.bot.app:
-        print("🤖 Starting Telegram bot...")
+        print("🤖 Starting Telegram bot...", flush=True)
         await engine.bot.app.initialize()
+        print("✅ Bot initialized", flush=True)
+
+        # Set commands now that bot is initialized
+        if getattr(engine.bot, '_commands_pending', False):
+            try:
+                from telegram import BotCommand
+                await engine.bot.app.bot.set_my_commands([
+                    BotCommand("start", "Welcome & menu"),
+                    BotCommand("trade", "Start trading"),
+                    BotCommand("stop", "Stop trading"),
+                    BotCommand("status", "Position & P&L status"),
+                    BotCommand("balance", "Check balance"),
+                    BotCommand("strategy", "View/change strategy"),
+                    BotCommand("markets", "Scan live markets"),
+                    BotCommand("history", "Trade history"),
+                    BotCommand("settings", "Bot settings"),
+                ])
+                print("✅ Bot commands registered", flush=True)
+            except Exception as e:
+                print(f"⚠️ Commands setup: {e}", flush=True)
+
         await engine.bot.app.start()
         await engine.bot.app.updater.start_polling(drop_pending_updates=True)
-        print("✅ Telegram bot is running!")
+        print("✅ Telegram bot is polling!", flush=True)
 
         # Send startup notification to Telegram
         if Config.TELEGRAM_CHAT_ID:
@@ -248,14 +269,15 @@ async def main():
                     text=msg,
                     parse_mode='Markdown'
                 )
+                print("✅ Startup message sent to Telegram", flush=True)
             except Exception as e:
-                print(f"⚠️ Couldn't send startup msg: {e}")
+                print(f"⚠️ Couldn't send startup msg: {e}", flush=True)
     else:
-        print("⚠️ No Telegram — auto-starting trading loop...")
+        print("⚠️ No Telegram — auto-starting trading loop...", flush=True)
         await engine.start()
 
-    # Auto-start trading if configured
-    print("\n💡 Send /trade in Telegram to start, or press Ctrl+C to quit\n")
+    # Keep running
+    print("\n💡 Bot is ready! Send /trade in Telegram to start trading.\n", flush=True)
 
     # Keep running
     try:

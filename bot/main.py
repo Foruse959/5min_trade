@@ -61,18 +61,28 @@ class TelegramBot:
         self.app.add_handler(CallbackQueryHandler(self.cb_command, pattern=r"^cmd_"))
         self.app.add_handler(CallbackQueryHandler(self.cb_back, pattern=r"^back_"))
 
-        # Set bot commands menu
-        await self.app.bot.set_my_commands([
-            BotCommand("start", "Welcome & menu"),
-            BotCommand("trade", "Start trading"),
-            BotCommand("stop", "Stop trading"),
-            BotCommand("status", "Position & P&L status"),
-            BotCommand("balance", "Check balance"),
-            BotCommand("strategy", "View/change strategy"),
-            BotCommand("markets", "Scan live markets"),
-            BotCommand("history", "Trade history"),
-            BotCommand("settings", "Bot settings"),
-        ])
+        # Set bot commands menu (may fail before initialize — that's ok)
+        try:
+            await self.app.bot.set_my_commands([
+                BotCommand("start", "Welcome & menu"),
+                BotCommand("trade", "Start trading"),
+                BotCommand("stop", "Stop trading"),
+                BotCommand("status", "Position & P&L status"),
+                BotCommand("balance", "Check balance"),
+                BotCommand("strategy", "View/change strategy"),
+                BotCommand("markets", "Scan live markets"),
+                BotCommand("history", "Trade history"),
+                BotCommand("settings", "Bot settings"),
+            ])
+        except Exception:
+            # Will be set after app.initialize() in main
+            self._commands_pending = True
+
+        # Log all errors instead of silently swallowing them
+        async def error_handler(update, context):
+            print(f"❌ Bot error: {context.error}")
+
+        self.app.add_error_handler(error_handler)
 
     # ═══════════════════════════════════════════════════════════════════
     # COMMANDS
