@@ -85,28 +85,32 @@ class TelegramBot:
         balance = self.engine.paper_trader.risk.balance if self.engine else Config.STARTING_BALANCE
 
         text = (
-            f"⚡ **5MIN\\_TRADE — Polymarket Crypto Scalper**\n\n"
+            f"⚡ *5MIN_TRADE — Polymarket Crypto Scalper*\n\n"
             f"Mode: {mode}\n"
             f"Status: {trading}\n"
             f"Balance: ${balance:.2f}\n"
             f"Coins: {', '.join(Config.ENABLED_COINS)}\n"
             f"Timeframes: {Config.ENABLED_TIMEFRAMES}\n\n"
-            f"🎯 *Strategies:*\n"
-            f"  🎰 Cheap Hunter — Buy 1\\-8¢ outcomes for 100x\n"
+            f"🎯 *Strategies (9 total):*\n"
+            f"  🎰 Cheap Hunter — Buy 1-8c outcomes\n"
             f"  📉📈 Momentum Reversal — Catch dips\n"
-            f"  💰 YES\\+NO Arb — Guaranteed profit\n"
-            f"  🎯 Oracle Arb — Binance price edge\n"
-            f"  ⚡ Dynamic — Auto\\-select best\n\n"
-            f"Use the menu below or type /trade to start\\!"
+            f"  📈 Trend Follower — Ride momentum\n"
+            f"  🔀 Straddle — Volatile plays\n"
+            f"  📊 Spread Scalper — Bid-ask profit\n"
+            f"  🎯 Mid Sniper — Underpriced outcomes\n"
+            f"  💰 YES+NO Arb — Guaranteed profit\n"
+            f"  🎯 Oracle Arb — Binance edge\n"
+            f"  ⏰ Time Decay — Near-expiry\n\n"
+            f"Use the menu below or type /trade to start!"
         )
-        await update.message.reply_text(text, parse_mode='MarkdownV2',
+        await update.message.reply_text(text, parse_mode='Markdown',
                                          reply_markup=main_menu_keyboard())
 
     async def cmd_trade(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start trading — select timeframe."""
         await update.message.reply_text(
-            "⏱️ **Select timeframe:**",
-            parse_mode='MarkdownV2',
+            "⏱️ *Select timeframe:*",
+            parse_mode='Markdown',
             reply_markup=timeframe_keyboard()
         )
 
