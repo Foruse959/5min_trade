@@ -20,6 +20,12 @@ class ClobClient:
             'User-Agent': '5min-trade-bot/1.0',
             'Accept': 'application/json',
         })
+        # Fallback prices from WS/gamma — set externally
+        self.fallback_prices: Dict[str, float] = {}
+
+    def set_fallback_price(self, token_id: str, price: float):
+        """Set a fallback price from WS or gamma data."""
+        self.fallback_prices[token_id] = price
 
     def get_price(self, token_id: str) -> Optional[float]:
         """Get current mid-price for a token."""
@@ -29,9 +35,10 @@ class ClobClient:
             if resp.status_code == 200:
                 data = resp.json()
                 return float(data.get('price', 0))
-        except Exception as e:
-            print(f"❌ Price fetch error: {e}")
-        return None
+        except Exception:
+            pass
+        # Fallback to stored price
+        return self.fallback_prices.get(token_id)
 
     def get_prices(self, token_ids: List[str]) -> Dict[str, float]:
         """Get prices for multiple tokens."""
@@ -45,6 +52,7 @@ class ClobClient:
     def get_orderbook(self, token_id: str) -> Optional[Dict]:
         """
         Fetch full orderbook for a token.
+        Falls back to synthetic orderbook from WS/gamma prices.
 
         Returns:
         {
@@ -64,47 +72,71 @@ class ClobClient:
         try:
             url = f"{self.base_url}/book?token_id={token_id}"
             resp = self.session.get(url, timeout=10)
-            if resp.status_code != 200:
-                return None
+            if resp.status_code == 200:
+                data = resp.json()
 
-            data = resp.json()
+                bids = sorted(
+                    [(float(b['price']), float(b['size'])) for b in data.get('bids', [])],
+                    key=lambda x: x[0], reverse=True
+                )
+                asks = sorted(
+                    [(float(a['price']), float(a['size'])) for a in data.get('asks', [])],
+                    key=lambda x: x[0]
+                )
 
-            bids = sorted(
-                [(float(b['price']), float(b['size'])) for b in data.get('bids', [])],
-                key=lambda x: x[0], reverse=True
-            )
-            asks = sorted(
-                [(float(a['price']), float(a['size'])) for a in data.get('asks', [])],
-                key=lambda x: x[0]
-            )
+                if bids or asks:
+                    best_bid = bids[0][0] if bids else 0.0
+                    best_ask = asks[0][0] if asks else 1.0
+                    spread = best_ask - best_bid
+                    mid = (best_bid + best_ask) / 2 if (best_bid + best_ask) > 0 else 0.5
 
-            best_bid = bids[0][0] if bids else 0.0
-            best_ask = asks[0][0] if asks else 1.0
-            spread = best_ask - best_bid
-            mid = (best_bid + best_ask) / 2 if (best_bid + best_ask) > 0 else 0.5
+                    bid_depth = sum(p * s for p, s in bids[:10])
+                    ask_depth = sum(p * s for p, s in asks[:10])
+                    total_depth = bid_depth + ask_depth
+                    imbalance = (bid_depth - ask_depth) / total_depth if total_depth > 0 else 0
 
-            bid_depth = sum(p * s for p, s in bids[:10])
-            ask_depth = sum(p * s for p, s in asks[:10])
-            total_depth = bid_depth + ask_depth
-            imbalance = (bid_depth - ask_depth) / total_depth if total_depth > 0 else 0
+                    return {
+                        'token_id': token_id,
+                        'bids': bids,
+                        'asks': asks,
+                        'best_bid': best_bid,
+                        'best_ask': best_ask,
+                        'spread': spread,
+                        'spread_pct': (spread / best_ask * 100) if best_ask > 0 else 0,
+                        'mid_price': mid,
+                        'bid_depth': bid_depth,
+                        'ask_depth': ask_depth,
+                        'imbalance': imbalance,
+                    }
+
+        except Exception:
+            pass
+
+        # ═══ FALLBACK: Build synthetic orderbook from WS/gamma prices ═══
+        price = self.fallback_prices.get(token_id)
+        if price and price > 0:
+            # Simulate a thin orderbook around the known price
+            spread = 0.02  # 2 cent spread
+            best_bid = max(0.01, price - spread / 2)
+            best_ask = min(0.99, price + spread / 2)
+            mid = price
 
             return {
                 'token_id': token_id,
-                'bids': bids,
-                'asks': asks,
+                'bids': [(best_bid, 100.0)],
+                'asks': [(best_ask, 100.0)],
                 'best_bid': best_bid,
                 'best_ask': best_ask,
                 'spread': spread,
                 'spread_pct': (spread / best_ask * 100) if best_ask > 0 else 0,
                 'mid_price': mid,
-                'bid_depth': bid_depth,
-                'ask_depth': ask_depth,
-                'imbalance': imbalance,
+                'bid_depth': best_bid * 100,
+                'ask_depth': best_ask * 100,
+                'imbalance': 0.0,
+                '_synthetic': True,  # Flag so strategies know this is approximate
             }
 
-        except Exception as e:
-            print(f"❌ Orderbook error for {token_id[:12]}...: {e}")
-            return None
+        return None
 
     def get_dual_orderbook(self, up_token: str, down_token: str) -> Optional[Dict]:
         """

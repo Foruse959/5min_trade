@@ -65,26 +65,37 @@ class PolymarketFeed:
     async def run(self):
         """Connect and stream prices."""
         self._running = True
+        _logged_first_msg = False
 
         while self._running:
             try:
-                async with websockets.connect(self.ws_url) as ws:
+                async with websockets.connect(
+                    self.ws_url,
+                    ping_interval=20,
+                    ping_timeout=60,
+                    close_timeout=10
+                ) as ws:
                     self._ws = ws
                     print(f"🔌 Polymarket WS connected", flush=True)
 
-                    # Subscribe to markets
-                    for token_id in self._subscribed_tokens:
+                    # Subscribe — single message with ALL token IDs
+                    if self._subscribed_tokens:
                         sub_msg = json.dumps({
-                            "type": "subscribe",
-                            "channel": "market",
-                            "assets_id": token_id,
+                            "assets_ids": self._subscribed_tokens,
+                            "type": "market",
                         })
                         await ws.send(sub_msg)
+                        print(f"   Subscribed to {len(self._subscribed_tokens)} tokens", flush=True)
 
                     # Listen for updates
                     async for message in ws:
                         if not self._running:
                             break
+                        # Log first raw message for debugging
+                        if not _logged_first_msg:
+                            _logged_first_msg = True
+                            preview = message[:200] if len(message) > 200 else message
+                            print(f"📨 First WS msg: {preview}", flush=True)
                         await self._handle_message(message)
 
             except websockets.ConnectionClosed:
@@ -95,11 +106,40 @@ class PolymarketFeed:
                 await asyncio.sleep(5)
 
     async def _handle_message(self, raw: str):
-        """Parse WebSocket message and update prices."""
+        """Parse WebSocket message and update prices.
+        
+        Polymarket CLOB WS sends:
+        1. Initial snapshot: list of orderbook objects with asset_id + asks
+        2. price_change events: {"event_type": "price_change", "price_changes": [...]}
+        3. Individual events with asset_id, price, best_bid, best_ask
+        """
         try:
             data = json.loads(raw)
-            msg_type = data.get('type', '')
 
+            # Format 1: Initial snapshot — list of orderbook entries
+            if isinstance(data, list):
+                for entry in data:
+                    asset_id = entry.get('asset_id', '')
+                    if not asset_id:
+                        continue
+                    asks = entry.get('asks', [])
+                    if asks:
+                        best_ask = min(float(a.get('price', a.get('p', 1.0))) for a in asks)
+                        self._apply_price(asset_id, best_ask)
+                return
+
+            # Format 2: price_change event
+            event_type = data.get('event_type', '')
+            if event_type == 'price_change':
+                for ch in data.get('price_changes', []):
+                    asset_id = ch.get('asset_id', '')
+                    best_ask = ch.get('best_ask')
+                    if asset_id and best_ask:
+                        self._apply_price(asset_id, float(best_ask))
+                return
+
+            # Format 3: Individual book/trade updates
+            msg_type = data.get('type', '')
             if msg_type in ('book', 'price_change', 'last_trade_price'):
                 token_id = data.get('asset_id', '')
                 if not token_id:
@@ -109,25 +149,34 @@ class PolymarketFeed:
                 best_bid = float(data.get('best_bid', 0))
                 best_ask = float(data.get('best_ask', 0))
 
-                if price <= 0 and best_bid > 0 and best_ask > 0:
+                if price <= 0 and best_ask > 0:
+                    price = best_ask
+                elif price <= 0 and best_bid > 0 and best_ask > 0:
                     price = (best_bid + best_ask) / 2
 
-                snap = PriceSnapshot(token_id, price, best_bid, best_ask)
-
-                # Store
-                self.latest_prices[token_id] = snap
-                if token_id in self.price_history:
-                    self.price_history[token_id].append(snap)
-
-                # Callback
-                if self._on_price_update:
-                    await self._on_price_update(snap)
-
-                # Flash crash detection
-                self._detect_flash_crash(token_id, snap)
+                if price > 0:
+                    self._apply_price(token_id, price, best_bid, best_ask)
 
         except Exception as e:
             pass  # Silently ignore malformed messages
+
+    def _apply_price(self, token_id: str, price: float,
+                     best_bid: float = 0, best_ask: float = 0):
+        """Store a price update and trigger callbacks."""
+        if best_ask <= 0:
+            best_ask = price
+        snap = PriceSnapshot(token_id, price, best_bid, best_ask)
+
+        self.latest_prices[token_id] = snap
+        if token_id in self.price_history:
+            self.price_history[token_id].append(snap)
+
+        # Callback
+        if self._on_price_update:
+            asyncio.create_task(self._on_price_update(snap))
+
+        # Flash crash detection
+        self._detect_flash_crash(token_id, snap)
 
     def _detect_flash_crash(self, token_id: str, current: PriceSnapshot):
         """Detect if there was a sudden price drop."""

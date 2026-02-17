@@ -170,6 +170,20 @@ class TradingEngine:
                 # Run strategy on EVERY market
                 strategy = self.strategies.get(self.active_strategy, self.dynamic_picker)
 
+                # Feed fallback prices into ClobClient from gamma + WS
+                for market in markets:
+                    up_tid = market.get('up_token_id', '')
+                    dn_tid = market.get('down_token_id', '')
+                    if up_tid:
+                        # Use WS price if available, else gamma price
+                        ws_snap = self.poly_feed.latest_prices.get(up_tid)
+                        price = ws_snap.price if ws_snap else market.get('up_price', 0.5)
+                        self.clob.set_fallback_price(up_tid, price)
+                    if dn_tid:
+                        ws_snap = self.poly_feed.latest_prices.get(dn_tid)
+                        price = ws_snap.price if ws_snap else market.get('down_price', 0.5)
+                        self.clob.set_fallback_price(dn_tid, price)
+
                 for market in markets:
                     if not self.is_running:
                         break
