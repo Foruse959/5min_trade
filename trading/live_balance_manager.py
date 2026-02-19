@@ -156,14 +156,16 @@ class LiveBalanceManager:
         """Which strategies are enabled at this mode."""
         if self.mode_name == 'concentration':
             return {
-                'enabled': ['cheap_hunter', 'oracle_arb', 'yes_no_arb'],
-                'disabled': ['straddle', 'trend_follower'],
+                'enabled': ['cheap_hunter', 'oracle_arb', 'yes_no_arb',
+                           'cross_tf_arb'],  # Guaranteed profit — always on
+                'disabled': ['straddle', 'trend_follower', 'penny_sniper'],
                 'min_confidence': self.mode.min_confidence,
             }
         elif self.mode_name == 'medium':
             return {
                 'enabled': ['cheap_hunter', 'oracle_arb', 'yes_no_arb',
-                           'mid_sniper', 'spread_scalper'],
+                           'cross_tf_arb', 'mid_sniper', 'spread_scalper',
+                           'penny_sniper'],
                 'disabled': ['straddle'],
                 'min_confidence': self.mode.min_confidence,
             }
