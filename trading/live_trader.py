@@ -95,6 +95,28 @@ class LiveTrader:
     def is_ready(self) -> bool:
         return self._initialized and self.clob_client is not None
 
+    async def fetch_balance(self) -> float:
+        """
+        Fetch real USDC balance from Polymarket.
+        Returns balance as float, or None if unavailable.
+        """
+        if not self.is_ready:
+            return None
+        try:
+            # Try the CLOB client's balance endpoint
+            bal_resp = self.clob_client.get_balance_allowance()
+            if bal_resp:
+                # balance_allowance response has 'balance' in USDC units
+                balance = float(bal_resp.get('balance', 0))
+                # CLOB returns balance in wei (6 decimals for USDC)
+                if balance > 1_000_000:
+                    balance = balance / 1_000_000
+                print(f"💰 Polymarket balance: ${balance:.2f}", flush=True)
+                return balance
+        except Exception as e:
+            print(f"⚠️ Could not fetch balance: {e}", flush=True)
+        return None
+
     async def execute_signal(self, signal: TradeSignal) -> Optional[Dict]:
         """Execute a trade signal by placing a LIMIT order on the CLOB."""
         if not self.is_ready:
@@ -297,7 +319,15 @@ class LiveTrader:
 
         mode = self.balance_mgr.mode_name
 
-        if mode == 'concentration':
+        if mode == 'seed':
+            # SEED MODE: Very conservative — protect capital at all costs
+            if gain >= 1.5:  # Take profit at 50% gain
+                return 'sell'
+            if gain >= 1.2 and seconds_remaining < 20:  # Take small gains near expiry
+                return 'sell'
+            if pnl_pct <= -10:  # Tight stop loss
+                return 'cut_loss'
+        elif mode == 'concentration':
             if gain >= 2.0:
                 return 'sell'
             if gain >= 1.5 and seconds_remaining < 30:

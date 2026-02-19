@@ -195,7 +195,7 @@ class TelegramBot:
         await update.message.reply_text(text)
 
     async def cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Show balance details."""
+        """Show balance details with real Polymarket balance."""
         if not self.engine:
             await update.message.reply_text("⚠️ Engine not initialized")
             return
@@ -210,13 +210,35 @@ class TelegramBot:
 
         if self.engine.live_trader.is_ready:
             live_stats = self.engine.live_trader.get_summary()
+            tracked_bal = live_stats.get('balance', 0)
+
+            # Fetch REAL balance from Polymarket
+            real_bal = await self.engine.live_trader.fetch_balance()
+            if real_bal is not None and real_bal > 0:
+                # Sync tracked balance with real balance
+                self.engine.live_balance_mgr.update_balance(real_bal)
+                bal_text = f"${real_bal:.2f}"
+                if abs(real_bal - tracked_bal) > 0.01:
+                    bal_text += f" (tracked: ${tracked_bal:.2f})"
+            else:
+                bal_text = f"${tracked_bal:.2f}"
+
             text += (
-                f"🔴 Live: ${live_stats.get('balance', 0):.2f} "
-                f"(PnL: ${live_stats.get('total_pnl', 0):+.2f})\n"
+                f"🔴 Live: {bal_text}\n"
+                f"   PnL: ${live_stats.get('total_pnl', 0):+.2f}\n"
                 f"   Mode: {live_stats.get('mode_emoji', '')} {live_stats.get('mode', '')}\n"
                 f"   Reserve: ${live_stats.get('reserve', 0):.2f}\n"
                 f"   Tradeable: ${live_stats.get('tradeable', 0):.2f}\n"
             )
+
+            # Show seed mode progress
+            if self.engine.live_balance_mgr.mode_name == 'seed':
+                from trading.live_balance_manager import SEED_GRADUATE_BALANCE
+                current = real_bal if real_bal else tracked_bal
+                progress = min(100, current / SEED_GRADUATE_BALANCE * 100)
+                bar_filled = int(progress / 10)
+                bar = '█' * bar_filled + '░' * (10 - bar_filled)
+                text += f"   🌱 Seed: [{bar}] {progress:.0f}% → ${SEED_GRADUATE_BALANCE:.2f}\n"
         else:
             text += "🔴 Live: Not configured\n"
 
@@ -380,9 +402,24 @@ class TelegramBot:
         """
         Activate SEED mode — designed for $1 starts.
         Usage: /seed [amount] — e.g., /seed 1, /seed 2.50
+        Automatically switches to LIVE mode.
         """
         if not self.engine:
             await update.message.reply_text("⚠️ Engine not initialized")
+            return
+
+        # Check if live trading is ready
+        if not self.engine.live_trader.is_ready:
+            await update.message.reply_text(
+                "❌ Live trading not configured!\n\n"
+                "You need POLY_PRIVATE_KEY in your .env file.\n"
+                "Seed mode requires live trading to work.\n\n"
+                "Set these in .env:\n"
+                "  POLY_PRIVATE_KEY=your_key\n"
+                "  POLY_API_KEY=your_api_key\n"
+                "  POLY_API_SECRET=your_secret\n"
+                "  POLY_PASSPHRASE=your_passphrase"
+            )
             return
 
         # Parse optional starting balance
@@ -403,31 +440,38 @@ class TelegramBot:
                 await update.message.reply_text("❌ Usage: /seed [amount]\nExample: /seed 1")
                 return
 
+        # Try to fetch real balance from Polymarket
+        real_balance = await self.engine.live_trader.fetch_balance()
+        if real_balance is not None and real_balance > 0:
+            starting_balance = real_balance
+
         # Set seed mode and update balance
         self.engine.live_balance_mgr.update_balance(starting_balance)
-        ok = self.engine.live_balance_mgr.set_mode('seed')
+        self.engine.live_balance_mgr.set_mode('seed')
 
-        if ok:
-            from trading.live_balance_manager import SEED_GRADUATE_BALANCE
-            msg = (
-                f"🌱 SEED MODE ACTIVATED\n\n"
-                f"💰 Starting balance: ${starting_balance:.2f}\n"
-                f"🎯 Goal: Grow to ${SEED_GRADUATE_BALANCE:.2f}\n\n"
-                f"📋 Rules:\n"
-                f"• Only guaranteed-profit strategies (arb-only)\n"
-                f"• 90%+ confidence required\n"
-                f"• 1 position at a time (focused)\n"
-                f"• Zero reserve — every cent works for you\n"
-                f"• Auto-upgrades to 🎯 CONCENTRATION at ${SEED_GRADUATE_BALANCE:.2f}\n\n"
-                f"Strategies active:\n"
-                f"  ✅ YES+NO Arb (guaranteed)\n"
-                f"  ✅ Cross-Timeframe Arb (guaranteed)\n"
-                f"  ✅ Oracle Arb (high-confidence)\n"
-                f"  ❌ Everything else (too risky)\n\n"
-                f"Start trading with /trade"
-            )
-        else:
-            msg = "❌ Failed to set seed mode"
+        # AUTO-SWITCH TO LIVE MODE
+        self.engine.trading_mode = 'live'
+
+        from trading.live_balance_manager import SEED_GRADUATE_BALANCE
+        bal_source = "fetched from Polymarket" if real_balance else "manual"
+        msg = (
+            f"🌱 SEED MODE ACTIVATED — LIVE\n\n"
+            f"💰 Balance: ${starting_balance:.2f} ({bal_source})\n"
+            f"🔴 Trading: LIVE MODE\n"
+            f"🎯 Goal: Grow to ${SEED_GRADUATE_BALANCE:.2f}\n\n"
+            f"📋 Rules:\n"
+            f"• Only guaranteed-profit strategies (arb-only)\n"
+            f"• 90%+ confidence required\n"
+            f"• 1 position at a time (focused)\n"
+            f"• Zero reserve — every cent works\n"
+            f"• Auto-upgrades to 🎯 CONCENTRATION at ${SEED_GRADUATE_BALANCE:.2f}\n\n"
+            f"Strategies active:\n"
+            f"  ✅ YES+NO Arb (guaranteed)\n"
+            f"  ✅ Cross-Timeframe Arb (guaranteed)\n"
+            f"  ✅ Oracle Arb (high-confidence)\n"
+            f"  ❌ Everything else (too risky)\n\n"
+            f"Start trading with /trade"
+        )
 
         await update.message.reply_text(msg)
 
