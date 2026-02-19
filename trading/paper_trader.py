@@ -162,7 +162,9 @@ class PaperTrader:
         gain = exit_price / pos['entry_price'] if pos['entry_price'] > 0 else 0
         emoji = '🤑' if pnl > 0 else '💸'
         print(f"{emoji} CLOSED: {pos['coin']} {pos['direction']} — "
-              f"${pnl:+.2f} ({gain:.1f}x) [{reason}]")
+              f"Entry:${pos['entry_price']:.3f} -> Exit:${exit_price:.3f} | "
+              f"${pnl:+.2f} ({gain:.1f}x) [{reason}] | "
+              f"Bal:${self.risk.balance:.2f}", flush=True)
 
     def get_open_positions(self) -> List[Dict]:
         return list(self.positions.values())

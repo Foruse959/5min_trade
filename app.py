@@ -25,6 +25,8 @@ from strategies.continuous import (
 )
 from trading.paper_trader import PaperTrader
 from trading.risk_manager import RiskManager
+from trading.live_trader import LiveTrader
+from trading.live_balance_manager import LiveBalanceManager
 from bot.main import TelegramBot
 
 
@@ -42,6 +44,16 @@ class TradingEngine:
         # Trading (with dynamic balance tiers)
         self.risk_manager = RiskManager()
         self.paper_trader = PaperTrader(self.db, self.risk_manager)
+
+        # Live trading
+        self.live_balance_mgr = LiveBalanceManager(
+            balance=Config.STARTING_BALANCE,
+            mode=Config.LIVE_RISK_MODE,
+        )
+        self.live_trader = LiveTrader(self.db, self.live_balance_mgr)
+
+        # Active trading mode: 'paper' or 'live'
+        self.trading_mode = Config.TRADING_MODE
 
         # ALL 9 strategies via dynamic picker
         self.dynamic_picker = DynamicPicker()
@@ -68,15 +80,53 @@ class TradingEngine:
         self._scan_task = None
         self._ws_tasks = []
 
+    @property
+    def active_trader(self):
+        """Returns the currently active trader (paper or live)."""
+        if self.trading_mode == 'live' and self.live_trader.is_ready:
+            return self.live_trader
+        return self.paper_trader
+
+    def switch_mode(self, mode: str) -> tuple:
+        """Switch trading mode. Returns (success, message)."""
+        mode = mode.lower()
+        if mode == 'live':
+            if not self.live_trader.is_ready:
+                return False, '❌ Live trader not initialized. Check POLY_PRIVATE_KEY.'
+            self.trading_mode = 'live'
+            return True, f'🔴 LIVE MODE — {self.live_balance_mgr.mode.emoji} {self.live_balance_mgr.mode.name}'
+        elif mode == 'paper':
+            self.trading_mode = 'paper'
+            return True, '📋 Paper mode activated'
+        return False, f'Unknown mode: {mode}'
+
+    def set_risk_mode(self, risk_mode: str) -> tuple:
+        """Set live trading risk mode. Returns (success, message)."""
+        if self.live_balance_mgr.set_mode(risk_mode):
+            m = self.live_balance_mgr.mode
+            return True, f'{m.emoji} {m.name}: {m.description}'
+        return False, f'Unknown risk mode: {risk_mode}. Use: concentration, medium, aggressive'
+
     async def init(self):
         """Initialize all components."""
         Config.print_status()
         await self.db.init()
+
+        # Initialize live trader (non-blocking — will just warn if no keys)
+        live_ok = await self.live_trader.init()
+        if live_ok:
+            print(f"🟢 Live trader ready — Mode: {self.live_balance_mgr.mode.emoji} "
+                  f"{self.live_balance_mgr.mode.name}", flush=True)
+        else:
+            print("📋 Paper trading only (no live credentials)", flush=True)
+            self.trading_mode = 'paper'
+
         if Config.TELEGRAM_BOT_TOKEN:
             await self.bot.setup()
         else:
             print("⚠️ No TELEGRAM_BOT_TOKEN — running without Telegram")
-        print("✅ All components initialized")
+
+        print(f"✅ All components initialized — Mode: {self.trading_mode.upper()}", flush=True)
 
     async def start(self):
         """Start the trading loop."""
@@ -215,10 +265,11 @@ class TradingEngine:
                         continue
 
                     if signal:
-                        print(f"🎯 Signal: {signal.strategy} → {market.get('coin','?')} "
+                        mode_tag = '🔴LIVE' if self.trading_mode == 'live' else '📋PAPER'
+                        print(f"🎯 [{mode_tag}] Signal: {signal.strategy} -> {market.get('coin','?')} "
                               f"{signal.direction} @ {signal.entry_price:.4f} "
                               f"(conf={signal.confidence:.0%})", flush=True)
-                        trade = await self.paper_trader.execute_signal(signal)
+                        trade = await self.active_trader.execute_signal(signal)
                         if trade:
                             await self.bot.send_trade_alert(trade)
                             print(f"✅ Trade executed: {trade.get('coin','?')} {trade.get('direction','?')}", flush=True)
@@ -237,7 +288,7 @@ class TradingEngine:
                 for m in markets:
                     secs_map[m['market_id']] = self.gamma.get_seconds_remaining(m)
 
-                closed = await self.paper_trader.check_positions(current_prices, secs_map)
+                closed = await self.active_trader.check_positions(current_prices, secs_map)
                 for trade in closed:
                     await self.bot.send_close_alert(trade)
 
@@ -248,9 +299,10 @@ class TradingEngine:
                 # Periodic PnL report every 10 minutes
                 if time.time() - _last_pnl_report >= 600:
                     _last_pnl_report = time.time()
-                    summary = self.paper_trader.get_summary()
-                    open_pos = self.paper_trader.get_open_positions()
-                    print(f"📊 PnL Report | Balance: ${summary.get('balance', 0):.2f} | "
+                    summary = self.active_trader.get_summary()
+                    open_pos = self.active_trader.get_open_positions()
+                    mode_tag = '🔴LIVE' if self.trading_mode == 'live' else '📋PAPER'
+                    print(f"📊 [{mode_tag}] PnL Report | Balance: ${summary.get('balance', 0):.2f} | "
                           f"Trades: {summary.get('total_trades', 0)} | "
                           f"Win: {summary.get('win_rate', 0):.0f}% | "
                           f"Open: {len(open_pos)}", flush=True)

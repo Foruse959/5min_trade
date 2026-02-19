@@ -25,9 +25,12 @@ class Config:
     # ═══════════════════════════════════════════════════════════════════
     POLY_PRIVATE_KEY = os.getenv('POLY_PRIVATE_KEY', '')
     POLY_SAFE_ADDRESS = os.getenv('POLY_SAFE_ADDRESS', '')
+    POLY_FUNDER_ADDRESS = os.getenv('POLY_FUNDER_ADDRESS', '')
     POLY_API_KEY = os.getenv('POLY_API_KEY', '')
     POLY_API_SECRET = os.getenv('POLY_API_SECRET', '')
     POLY_PASSPHRASE = os.getenv('POLY_PASSPHRASE', '')
+    POLY_SIGNATURE_TYPE = int(os.getenv('POLY_SIGNATURE_TYPE', '0'))  # 0=EOA, 1=Magic
+    POLY_CHAIN_ID = int(os.getenv('POLY_CHAIN_ID', '137'))  # Polygon mainnet
 
     # ═══════════════════════════════════════════════════════════════════
     # API ENDPOINTS
@@ -42,7 +45,9 @@ class Config:
     # TRADING MODE
     # ═══════════════════════════════════════════════════════════════════
     TRADING_MODE = os.getenv('TRADING_MODE', 'paper')  # 'paper' or 'live'
+    LIVE_RISK_MODE = os.getenv('LIVE_RISK_MODE', 'concentration')  # concentration/medium/aggressive
     STARTING_BALANCE = float(os.getenv('STARTING_BALANCE', '100.0'))
+    POLYMARKET_MIN_ORDER_SIZE = 1.0  # Polymarket minimum order = $1
 
     # ═══════════════════════════════════════════════════════════════════
     # COINS

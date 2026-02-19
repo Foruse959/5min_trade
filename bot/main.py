@@ -53,6 +53,10 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("history", self.cmd_history))
         self.app.add_handler(CommandHandler("settings", self.cmd_settings))
         self.app.add_handler(CommandHandler("markets", self.cmd_markets))
+        self.app.add_handler(CommandHandler("mode", self.cmd_mode))
+        self.app.add_handler(CommandHandler("risk", self.cmd_risk))
+        self.app.add_handler(CommandHandler("positions", self.cmd_positions))
+        self.app.add_handler(CommandHandler("estop", self.cmd_estop))
 
         # Callback handlers
         self.app.add_handler(CallbackQueryHandler(self.cb_timeframe, pattern=r"^tf_"))
@@ -60,6 +64,8 @@ class TelegramBot:
         self.app.add_handler(CallbackQueryHandler(self.cb_coin, pattern=r"^coin_"))
         self.app.add_handler(CallbackQueryHandler(self.cb_command, pattern=r"^cmd_"))
         self.app.add_handler(CallbackQueryHandler(self.cb_back, pattern=r"^back_"))
+        self.app.add_handler(CallbackQueryHandler(self.cb_mode, pattern=r"^mode_"))
+        self.app.add_handler(CallbackQueryHandler(self.cb_risk, pattern=r"^risk_"))
 
         # Set bot commands menu (may fail before initialize — that's ok)
         try:
@@ -67,10 +73,14 @@ class TelegramBot:
                 BotCommand("start", "Welcome & menu"),
                 BotCommand("trade", "Start trading"),
                 BotCommand("stop", "Stop trading"),
+                BotCommand("mode", "Switch paper/live mode"),
+                BotCommand("risk", "Set risk mode"),
                 BotCommand("status", "Position & P&L status"),
                 BotCommand("balance", "Check balance"),
+                BotCommand("positions", "View open positions"),
                 BotCommand("strategy", "View/change strategy"),
                 BotCommand("markets", "Scan live markets"),
+                BotCommand("estop", "Emergency stop"),
                 BotCommand("history", "Trade history"),
                 BotCommand("settings", "Bot settings"),
             ])
@@ -136,33 +146,51 @@ class TelegramBot:
             await update.message.reply_text("⚠️ Engine not initialized")
             return
 
-        positions = self.engine.paper_trader.get_open_positions()
-        stats = self.engine.paper_trader.get_summary()
+        trader = self.engine.active_trader
+        positions = trader.get_open_positions()
+        stats = trader.get_summary()
+        is_live = stats.get('_live', False)
+        mode_tag = '🔴 LIVE' if is_live else '📋 PAPER'
 
         if not positions:
-            pos_text = "_No open positions_"
+            pos_text = "  No open positions"
         else:
             lines = []
             for p in positions:
                 emoji = '🟢' if (p.get('pnl') or 0) >= 0 else '🔴'
+                status = p.get('status', 'open')
+                status_tag = ' [PENDING]' if status == 'pending' else ''
                 lines.append(
                     f"{emoji} {p['coin']} {p['direction']} "
-                    f"@{p['entry_price']:.4f} ({p['strategy']})"
+                    f"@${p['entry_price']:.3f} (${p.get('size_usd', 0):.2f}) "
+                    f"[{p['strategy']}]{status_tag}"
                 )
             pos_text = '\n'.join(lines)
 
         text = (
-            f"📊 **Status** ({stats.get('tier_emoji','')} {stats.get('tier','')})\n\n"
-            f"💰 Balance: ${stats['balance']:.2f} "
-            f"(Tradeable: ${stats.get('tradeable', 0):.2f})\n"
-            f"📈 Daily P&L: ${stats['daily_pnl']:+.2f}\n"
-            f"🎯 Win Rate: {stats['win_rate']:.0f}%\n"
-            f"📊 Trades: {stats['total_trades']} "
-            f"(W:{stats['wins']} L:{stats['losses']})\n\n"
-            f"**Open Positions ({stats['open_count']}):**\n"
+            f"📊 Status {mode_tag}\n\n"
+            f"💰 Balance: ${stats.get('balance', 0):.2f}\n"
+        )
+
+        if is_live:
+            text += (
+                f"🛡️ Reserve: ${stats.get('reserve', 0):.2f}\n"
+                f"🎯 Mode: {stats.get('mode_emoji', '')} {stats.get('mode', '')}\n"
+            )
+        else:
+            text += (
+                f"🎯 Tier: {stats.get('tier_emoji', '')} {stats.get('tier', '')}\n"
+            )
+
+        text += (
+            f"🎯 Win Rate: {stats.get('win_rate', 0):.0f}%\n"
+            f"📊 Trades: {stats.get('total_trades', 0)} "
+            f"(W:{stats.get('wins', 0)} L:{stats.get('losses', 0)})\n"
+            f"💸 Total PnL: ${stats.get('total_pnl', 0):+.2f}\n\n"
+            f"Open Positions ({stats.get('open_count', len(positions))}):\n"
             f"{pos_text}"
         )
-        await update.message.reply_text(text, parse_mode='Markdown')
+        await update.message.reply_text(text)
 
     async def cmd_balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show balance details."""
@@ -170,17 +198,29 @@ class TelegramBot:
             await update.message.reply_text("⚠️ Engine not initialized")
             return
 
-        stats = self.engine.paper_trader.get_summary()
-        mode = "📋 PAPER" if Config.is_paper() else "🔴 LIVE"
+        paper_stats = self.engine.paper_trader.get_summary()
 
         text = (
-            f"💰 **Balance** ({mode})\n\n"
-            f"Current: ${stats['balance']:.2f}\n"
-            f"Starting: ${Config.STARTING_BALANCE:.2f}\n"
-            f"Total P&L: ${stats['total_pnl']:+.2f}\n"
-            f"Daily P&L: ${stats['daily_pnl']:+.2f}\n"
+            f"💰 BALANCE\n\n"
+            f"📋 Paper: ${paper_stats.get('balance', 0):.2f} "
+            f"(PnL: ${paper_stats.get('total_pnl', 0):+.2f})\n"
         )
-        await update.message.reply_text(text, parse_mode='Markdown')
+
+        if self.engine.live_trader.is_ready:
+            live_stats = self.engine.live_trader.get_summary()
+            text += (
+                f"🔴 Live: ${live_stats.get('balance', 0):.2f} "
+                f"(PnL: ${live_stats.get('total_pnl', 0):+.2f})\n"
+                f"   Mode: {live_stats.get('mode_emoji', '')} {live_stats.get('mode', '')}\n"
+                f"   Reserve: ${live_stats.get('reserve', 0):.2f}\n"
+                f"   Tradeable: ${live_stats.get('tradeable', 0):.2f}\n"
+            )
+        else:
+            text += "🔴 Live: Not configured\n"
+
+        mode = self.engine.trading_mode.upper()
+        text += f"\nActive: {mode}"
+        await update.message.reply_text(text)
 
     async def cmd_strategy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show strategy selection."""
@@ -219,12 +259,14 @@ class TelegramBot:
             await update.message.reply_text("⚠️ Engine not initialized")
             return
 
-        trades = self.engine.paper_trader.trade_history[-10:]  # Last 10
+        trader = self.engine.active_trader
+        trades = trader.trade_history[-10:]
         if not trades:
             await update.message.reply_text("📜 No trade history yet.")
             return
 
-        lines = ["📜 **Recent Trades:**\n"]
+        mode_tag = '🔴LIVE' if self.engine.trading_mode == 'live' else '📋PAPER'
+        lines = [f"📜 Recent Trades ({mode_tag}):\n"]
         for t in reversed(trades):
             emoji = '✅' if (t.get('pnl') or 0) > 0 else '❌'
             pnl = t.get('pnl', 0) or 0
@@ -234,19 +276,165 @@ class TelegramBot:
                 f"[{t.get('strategy', '?')}]"
             )
 
-        await update.message.reply_text('\n'.join(lines), parse_mode='Markdown')
+        await update.message.reply_text('\n'.join(lines))
 
     async def cmd_settings(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Show settings."""
         await update.message.reply_text(
-            "⚙️ **Settings:**",
-            parse_mode='Markdown',
+            "⚙️ Settings:",
             reply_markup=settings_keyboard()
         )
 
     # ═══════════════════════════════════════════════════════════════════
+    # LIVE TRADING COMMANDS
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def cmd_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Switch between paper and live trading mode."""
+        if not self.engine:
+            await update.message.reply_text("⚠️ Engine not initialized")
+            return
+
+        # Check if user passed argument: /mode live or /mode paper
+        args = context.args
+        if args:
+            mode = args[0].lower()
+            ok, msg = self.engine.switch_mode(mode)
+            await update.message.reply_text(msg)
+            return
+
+        # Show mode selection buttons
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        current = self.engine.trading_mode
+        live_ready = self.engine.live_trader.is_ready
+
+        buttons = [
+            [InlineKeyboardButton(
+                f"{'✅ ' if current == 'paper' else ''}📋 Paper Mode",
+                callback_data="mode_paper"
+            )],
+        ]
+        if live_ready:
+            buttons.append([InlineKeyboardButton(
+                f"{'✅ ' if current == 'live' else ''}🔴 Live Mode",
+                callback_data="mode_live"
+            )])
+        else:
+            buttons.append([InlineKeyboardButton(
+                "🔴 Live Mode (not configured)", callback_data="mode_na"
+            )])
+
+        mode_label = '🔴 LIVE' if current == 'live' else '📋 PAPER'
+        text = (
+            f"⚡ TRADING MODE\n\n"
+            f"Current: {mode_label}\n"
+        )
+        if current == 'live':
+            m = self.engine.live_balance_mgr.mode
+            text += f"Risk: {m.emoji} {m.name}\n"
+
+        await update.message.reply_text(
+            text, reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    async def cmd_risk(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Set live trading risk mode."""
+        if not self.engine:
+            await update.message.reply_text("⚠️ Engine not initialized")
+            return
+
+        # Check if user passed argument: /risk aggressive
+        args = context.args
+        if args:
+            risk = args[0].lower()
+            ok, msg = self.engine.set_risk_mode(risk)
+            await update.message.reply_text(msg)
+            return
+
+        # Show risk mode buttons
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        current = self.engine.live_balance_mgr.mode_name
+        from trading.live_balance_manager import LIVE_MODES
+
+        buttons = []
+        for key, mode in LIVE_MODES.items():
+            check = '✅ ' if key == current else ''
+            buttons.append([InlineKeyboardButton(
+                f"{check}{mode.emoji} {mode.name} — {mode.description}",
+                callback_data=f"risk_{key}"
+            )])
+
+        text = (
+            f"🎯 RISK MODE\n\n"
+            f"Current: {self.engine.live_balance_mgr.mode.emoji} "
+            f"{self.engine.live_balance_mgr.mode.name}\n\n"
+            f"Select a mode:"
+        )
+        await update.message.reply_text(
+            text, reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    async def cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show detailed open positions."""
+        if not self.engine:
+            await update.message.reply_text("⚠️ Engine not initialized")
+            return
+
+        trader = self.engine.active_trader
+        positions = trader.get_open_positions()
+        mode_tag = '🔴LIVE' if self.engine.trading_mode == 'live' else '📋PAPER'
+
+        if not positions:
+            await update.message.reply_text(f"📊 No open positions ({mode_tag})")
+            return
+
+        lines = [f"📊 Open Positions ({mode_tag}) — {len(positions)} total\n"]
+        for i, p in enumerate(positions, 1):
+            status = p.get('status', 'open')
+            status_tag = '⏳' if status == 'pending' else '🟢'
+            entry = p.get('entry_price', 0)
+            size = p.get('size_usd', 0)
+            coin = p.get('coin', '?')
+            direction = p.get('direction', '?')
+            strategy = p.get('strategy', '?')
+            entry_time = p.get('entry_time', '?')
+
+            lines.append(
+                f"{status_tag} #{i}. {coin} {direction}\n"
+                f"   Entry: ${entry:.3f} | Size: ${size:.2f}\n"
+                f"   Strategy: {strategy}\n"
+                f"   Time: {entry_time}\n"
+            )
+
+        await update.message.reply_text('\n'.join(lines))
+
+    async def cmd_estop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Emergency stop — cancel all orders and stop trading."""
+        if not self.engine:
+            await update.message.reply_text("⚠️ Engine not initialized")
+            return
+
+        text = "🛑 EMERGENCY STOP\n\n"
+
+        # Cancel live orders
+        if self.engine.live_trader.is_ready:
+            count = await self.engine.live_trader.cancel_all_orders()
+            text += f"Cancelled {count} live orders\n"
+
+        # Stop engine
+        await self.engine.stop()
+        text += "Trading stopped\n"
+
+        # Switch to paper
+        self.engine.trading_mode = 'paper'
+        text += "Switched to paper mode"
+
+        await update.message.reply_text(text)
+
+    # ═══════════════════════════════════════════════════════════════════
     # CALLBACKS
     # ═══════════════════════════════════════════════════════════════════
+
 
     async def cb_timeframe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle timeframe selection."""
@@ -343,6 +531,38 @@ class TelegramBot:
             parse_mode='MarkdownV2',
             reply_markup=main_menu_keyboard()
         )
+
+    async def cb_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle mode selection inline buttons."""
+        query = update.callback_query
+        await query.answer()
+        data = query.data  # e.g. "mode_paper" or "mode_live" or "mode_na"
+
+        if data == 'mode_na':
+            await query.edit_message_text(
+                "❌ Live trading requires POLY_PRIVATE_KEY in .env"
+            )
+            return
+
+        mode = data.replace('mode_', '')
+        if self.engine:
+            ok, msg = self.engine.switch_mode(mode)
+            await query.edit_message_text(msg)
+        else:
+            await query.edit_message_text("⚠️ Engine not initialized")
+
+    async def cb_risk(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle risk mode selection inline buttons."""
+        query = update.callback_query
+        await query.answer()
+        data = query.data  # e.g. "risk_concentration"
+
+        risk_mode = data.replace('risk_', '')
+        if self.engine:
+            ok, msg = self.engine.set_risk_mode(risk_mode)
+            await query.edit_message_text(msg)
+        else:
+            await query.edit_message_text("⚠️ Engine not initialized")
 
     # ═══════════════════════════════════════════════════════════════════
     # NOTIFICATIONS
