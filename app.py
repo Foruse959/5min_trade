@@ -215,17 +215,28 @@ class TradingEngine:
                     await asyncio.sleep(5)
                     continue
 
-                # Get balance tier preferences
-                balance_prefs = self.risk_manager.get_balance_preferences()
+                # Get strategy preferences based on ACTIVE trading mode
+                if self.trading_mode == 'live':
+                    balance_prefs = self.live_balance_mgr.get_strategy_filter()
+                else:
+                    balance_prefs = self.risk_manager.get_balance_preferences()
 
-                # Log tier status periodically
+                # Log status periodically
                 if scan_count % 50 == 1:
-                    stats = self.risk_manager.get_stats()
-                    print(f"📊 [{stats.get('tier_emoji','')} {stats.get('tier','')}] "
-                          f"Balance: ${stats['balance']:.2f} | "
-                          f"Trades: {stats['total_trades']} | "
-                          f"Win: {stats['win_rate']:.0f}% | "
-                          f"Markets: {len(markets)}")
+                    if self.trading_mode == 'live':
+                        m = self.live_balance_mgr.mode
+                        bal = self.live_balance_mgr.balance
+                        print(f"📊 [{m.emoji} {m.name}] "
+                              f"Balance: ${bal:.2f} | "
+                              f"Enabled: {balance_prefs.get('enabled', 'all')} | "
+                              f"Markets: {len(markets)}")
+                    else:
+                        stats = self.risk_manager.get_stats()
+                        print(f"📊 [{stats.get('tier_emoji','')} {stats.get('tier','')}] "
+                              f"Balance: ${stats['balance']:.2f} | "
+                              f"Trades: {stats['total_trades']} | "
+                              f"Win: {stats['win_rate']:.0f}% | "
+                              f"Markets: {len(markets)}")
 
                 # Run strategy on EVERY market
                 strategy = self.strategies.get(self.active_strategy, self.dynamic_picker)

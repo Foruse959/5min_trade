@@ -104,13 +104,9 @@ class LiveTrader:
         if not self.is_ready:
             return None
 
-        # Method 1: CLOB get_balance_allowance with explicit signature_type
+        # Method 1: CLOB get_balance_allowance (no args)
         try:
-            from config import Config
-            sig_type = Config.POLY_SIGNATURE_TYPE
-            bal_resp = self.clob_client.get_balance_allowance(
-                signature_type=sig_type
-            )
+            bal_resp = self.clob_client.get_balance_allowance()
             if bal_resp:
                 balance = float(bal_resp.get('balance', 0))
                 # CLOB returns balance in atomic units (6 decimals for USDC)
@@ -119,50 +115,30 @@ class LiveTrader:
                 print(f"💰 Polymarket balance: ${balance:.6f}", flush=True)
                 return round(balance, 2)
         except Exception as e:
-            print(f"⚠️ balance_allowance failed: {e}", flush=True)
+            print(f"⚠️ CLOB balance failed: {e}", flush=True)
 
-        # Method 2: Direct REST API call  
+        # Method 2: On-chain USDC balance via Polygon RPC
         try:
             import requests
             from config import Config
-            headers = {}
-            if self.clob_client.creds:
-                headers['Authorization'] = f"Bearer {self.clob_client.creds.api_key}"
-            resp = requests.get(
-                f"{Config.CLOB_API_URL}/balance-allowance?signature_type={Config.POLY_SIGNATURE_TYPE}",
-                headers=headers,
-                timeout=5,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                balance = float(data.get('balance', 0))
-                if balance > 1_000_000:
-                    balance = balance / 1e6
-                print(f"💰 Polymarket balance (REST): ${balance:.6f}", flush=True)
-                return round(balance, 2)
-        except Exception as e:
-            print(f"⚠️ REST balance failed: {e}", flush=True)
 
-        # Method 3: On-chain USDC balance via Polygon RPC
-        try:
-            import requests
+            # Derive wallet address from private key
             from eth_account import Account
-            from config import Config
-            
             wallet = Account.from_key(Config.POLY_PRIVATE_KEY)
             address = wallet.address
-            
-            # USDC contract on Polygon
+
+            # USDC contract on Polygon (PoS bridged)
             usdc_contract = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-            # balanceOf(address) function selector
-            data = f"0x70a08231000000000000000000000000{address[2:]}"
-            
+            # balanceOf(address) selector = 0x70a08231
+            padded_addr = address[2:].lower().zfill(64)
+            call_data = f"0x70a08231{padded_addr}"
+
             resp = requests.post(
                 "https://polygon-rpc.com",
                 json={
                     "jsonrpc": "2.0",
                     "method": "eth_call",
-                    "params": [{"to": usdc_contract, "data": data}, "latest"],
+                    "params": [{"to": usdc_contract, "data": call_data}, "latest"],
                     "id": 1,
                 },
                 timeout=5,
@@ -171,10 +147,44 @@ class LiveTrader:
                 result = resp.json().get("result", "0x0")
                 balance_wei = int(result, 16)
                 balance = balance_wei / 1e6  # USDC has 6 decimals
-                print(f"💰 On-chain USDC balance: ${balance:.6f}", flush=True)
+                print(f"💰 On-chain USDC: ${balance:.6f}", flush=True)
                 return round(balance, 2)
         except Exception as e:
             print(f"⚠️ On-chain balance failed: {e}", flush=True)
+
+        # Method 3: Try USDCe (native USDC on Polygon)
+        try:
+            import requests
+            from config import Config
+            from eth_account import Account
+
+            wallet = Account.from_key(Config.POLY_PRIVATE_KEY)
+            address = wallet.address
+
+            # Native USDC on Polygon
+            usdce_contract = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+            padded_addr = address[2:].lower().zfill(64)
+            call_data = f"0x70a08231{padded_addr}"
+
+            resp = requests.post(
+                "https://polygon-rpc.com",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "eth_call",
+                    "params": [{"to": usdce_contract, "data": call_data}, "latest"],
+                    "id": 1,
+                },
+                timeout=5,
+            )
+            if resp.status_code == 200:
+                result = resp.json().get("result", "0x0")
+                balance_wei = int(result, 16)
+                balance = balance_wei / 1e6
+                if balance > 0:
+                    print(f"💰 On-chain USDCe: ${balance:.6f}", flush=True)
+                    return round(balance, 2)
+        except Exception as e:
+            print(f"⚠️ USDCe balance failed: {e}", flush=True)
 
         return None
 
