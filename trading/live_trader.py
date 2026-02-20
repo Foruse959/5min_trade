@@ -33,7 +33,8 @@ class LiveTrader:
     """
 
     ORDER_TIMEOUT = 60  # Cancel unfilled orders after 60 seconds (thin 5m markets need more time)
-    TAKER_FEE_RATE = 0.0156  # ~1.56% dynamic taker fee on 5m/15m crypto markets
+    BASE_TAKER_FEE_RATE = 0.0156  # ~1.56% dynamic taker fee on 5m/15m crypto markets
+    TAKER_FEE_RATE = 0.0156  # Updated dynamically per-trade
 
     def __init__(self, db: Database, balance_mgr: LiveBalanceManager):
         self.db = db
@@ -43,6 +44,9 @@ class LiveTrader:
         self.trade_history: List[Dict] = []
         self.clob_client = None
         self._initialized = False
+        self._consecutive_failures = 0
+        self._trading_paused = False
+        self._pause_reason = ''
 
     async def init(self):
         """Initialize CLOB client with credentials."""
@@ -97,6 +101,23 @@ class LiveTrader:
                     print(f"💰 Dynamic taker fee rate: {fee_rate:.4f} ({fee_rate*100:.2f}%)", flush=True)
             except Exception as e:
                 print(f"⚠️ Fee rate fetch failed, using default {self.TAKER_FEE_RATE:.4f}: {e}", flush=True)
+
+            # === CRITICAL: Check actual balance before trading ===
+            real_balance = await self._fetch_live_balance()
+            if real_balance is not None:
+                if real_balance < 1.0:
+                    print(f"\n{'='*60}", flush=True)
+                    print(f"⚠️  WARNING: Polymarket balance is ${real_balance:.2f}", flush=True)
+                    print(f"  You need to deposit USDC to trade live.", flush=True)
+                    print(f"  1. Go to https://polymarket.com", flush=True)
+                    print(f"  2. Deposit USDC to your wallet", flush=True)
+                    print(f"  3. Make sure CLOB allowance is set", flush=True)
+                    print(f"{'='*60}\n", flush=True)
+                    self._trading_paused = True
+                    self._pause_reason = f'No balance (${real_balance:.2f})'
+                else:
+                    print(f"💰 Real Polymarket balance: ${real_balance:.2f}", flush=True)
+                    self.balance_mgr.update_balance(real_balance)
 
             self._initialized = True
             return True
@@ -211,6 +232,10 @@ class LiveTrader:
             print("⚠️ LiveTrader not initialized", flush=True)
             return None
 
+        # Check if trading is paused due to repeated failures
+        if self._trading_paused:
+            return None
+
         can_trade, reason = self.balance_mgr.can_trade()
         if not can_trade:
             return None
@@ -219,31 +244,94 @@ class LiveTrader:
         if size < Config.POLYMARKET_MIN_ORDER_SIZE:
             return None
 
-        # For straddle (BOTH), split size
+        # For BOTH-side strategies (arb, straddle), execute both legs
         if signal.direction == 'BOTH' and '|' in signal.token_id:
-            tokens = signal.token_id.split('|')
-            half_size = max(Config.POLYMARKET_MIN_ORDER_SIZE, size / 2)
-            results = []
-            for i, tid in enumerate(tokens):
-                side_name = 'UP' if i == 0 else 'DOWN'
-                sub_signal = TradeSignal(
-                    strategy=signal.strategy,
-                    coin=signal.coin,
-                    timeframe=signal.timeframe,
-                    direction=side_name,
-                    token_id=tid,
-                    market_id=signal.market_id,
-                    entry_price=signal.entry_price / 2,
-                    confidence=signal.confidence,
-                    rationale=signal.rationale,
-                    metadata=signal.metadata,
-                )
-                result = await self._place_limit_buy(sub_signal, half_size)
-                if result:
-                    results.append(result)
-            return results[0] if results else None
+            return await self._execute_both_sides(signal, size)
 
         return await self._place_limit_buy(signal, size)
+
+    async def _execute_both_sides(self, signal: TradeSignal, total_size: float) -> Optional[Dict]:
+        """Execute a dual-leg trade (arb, straddle).
+        
+        Uses per-leg prices from strategy metadata when available.
+        Falls back to splitting entry_price for simple straddles.
+        """
+        tokens = signal.token_id.split('|')
+        if len(tokens) != 2:
+            print(f"❌ BOTH-side: expected 2 tokens, got {len(tokens)}", flush=True)
+            return None
+
+        meta = signal.metadata or {}
+        half_size = max(Config.POLYMARKET_MIN_ORDER_SIZE, total_size / 2)
+
+        # Extract per-leg prices from strategy metadata
+        if meta.get('type') == 'cross_timeframe_arb':
+            # Cross-TF arb: metadata has primary_price and hedge_price
+            prices = [meta.get('primary_price', signal.entry_price / 2),
+                      meta.get('hedge_price', signal.entry_price / 2)]
+            sides = [meta.get('primary_side', 'UP'), meta.get('hedge_side', 'DOWN')]
+            market_ids = signal.market_id.split('|') if '|' in signal.market_id else [signal.market_id, signal.market_id]
+        elif meta.get('type') == 'both_sides':
+            # Cheap outcome hunter: up_ask and down_ask
+            prices = [meta.get('up_ask', signal.entry_price / 2),
+                      meta.get('down_ask', signal.entry_price / 2)]
+            sides = ['UP', 'DOWN']
+            market_ids = [signal.market_id, signal.market_id]
+        else:
+            # Yes/No arb or generic BOTH: up_ask and down_ask
+            prices = [meta.get('up_ask', signal.entry_price / 2),
+                      meta.get('down_ask', signal.entry_price / 2)]
+            sides = ['UP', 'DOWN']
+            market_ids = [signal.market_id, signal.market_id]
+
+        results = []
+        for i, (tid, price, side, mid) in enumerate(zip(tokens, prices, sides, market_ids)):
+            sub_signal = TradeSignal(
+                strategy=signal.strategy,
+                coin=signal.coin,
+                timeframe=signal.timeframe,
+                direction=side,
+                token_id=tid,
+                market_id=mid,
+                entry_price=price,
+                confidence=signal.confidence,
+                rationale=f"[Leg {i+1}/2] {signal.rationale}",
+                metadata={**meta, 'is_dual_leg': True, 'leg_number': i+1},
+            )
+            result = await self._place_limit_buy(sub_signal, half_size)
+            if result:
+                results.append(result)
+            else:
+                # If first leg succeeds but second fails, cancel the first
+                if results:
+                    first = results[0]
+                    try:
+                        self.clob_client.cancel(first.get('order_id', ''))
+                        print(f"⚠️ Leg 2 failed, cancelled leg 1: {first['order_id']}", flush=True)
+                        self.balance_mgr.open_positions = max(0, self.balance_mgr.open_positions - 1)
+                        self.balance_mgr.update_balance(self.balance_mgr.balance + first['size_usd'])
+                    except Exception:
+                        pass
+                    return None
+
+        if results:
+            print(f"✅ Both legs placed for {signal.strategy}: {signal.coin}", flush=True)
+        return results[0] if results else None
+
+    def _get_dynamic_fee_rate(self, price: float) -> float:
+        """Calculate per-trade fee rate based on probability (price).
+        
+        Polymarket's dynamic taker fees are highest near 50% and lowest
+        near the extremes (0% / 100%). The fee curve is approximately:
+            fee = BASE_FEE * 4 * price * (1 - price)
+        This peaks at price=0.50 and drops to ~0 at price=0.01 or 0.99.
+        
+        For 5m/15m crypto markets: BASE_FEE ~= 1.56% max at 50%.
+        """
+        # Fee curve: peaks at p=0.50, zero at p=0 and p=1
+        probability_factor = 4.0 * price * (1.0 - price)  # 0.0 at edges, 1.0 at 50%
+        fee = self.BASE_TAKER_FEE_RATE * probability_factor
+        return max(0.0, min(self.BASE_TAKER_FEE_RATE, fee))
 
     async def _place_limit_buy(self, signal: TradeSignal, size: float) -> Optional[Dict]:
         """Place a limit buy order on the CLOB."""
@@ -254,6 +342,10 @@ class LiveTrader:
             # Tick-align price to 0.01 increments (Polymarket requirement)
             price = max(0.01, min(0.99, round(signal.entry_price * 100) / 100))
 
+            # Calculate per-trade dynamic fee based on probability
+            trade_fee = self._get_dynamic_fee_rate(price)
+            self.TAKER_FEE_RATE = trade_fee  # Update for PnL calcs
+
             shares = round(size / price, 2)
             if shares < 1:
                 return None  # Minimum ~1 share
@@ -261,9 +353,9 @@ class LiveTrader:
             trade_id = str(uuid.uuid4())[:8]
             now = datetime.now().isoformat()
 
-            print(f"📤 PLACING ORDER: {signal.coin} {signal.direction} | "
+            print(f"\ud83d\udce4 PLACING ORDER: {signal.coin} {signal.direction} | "
                   f"${size:.2f} @ ${price:.3f} ({shares:.1f} shares) "
-                  f"[fee~{self.TAKER_FEE_RATE*100:.2f}%]", flush=True)
+                  f"[fee~{trade_fee*100:.2f}%]", flush=True)
 
             order_args = OrderArgs(
                 price=price,
@@ -315,14 +407,29 @@ class LiveTrader:
             self.balance_mgr.update_balance(self.balance_mgr.balance - size)
 
             await self.db.save_trade(trade)
+            self._consecutive_failures = 0  # Reset on success
             return trade
 
         except Exception as e:
+            error_str = str(e).lower()
             print(f"❌ Order error: {e}", flush=True)
+
+            # Detect balance/allowance errors and stop spamming
+            if 'balance' in error_str or 'allowance' in error_str:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= 5:
+                    self._trading_paused = True
+                    self._pause_reason = 'Not enough balance/allowance'
+                    print(f"\n{'='*60}", flush=True)
+                    print(f"🛑 TRADING PAUSED: {self._consecutive_failures} consecutive balance errors", flush=True)
+                    print(f"  Deposit USDC at https://polymarket.com", flush=True)
+                    print(f"  Then restart the bot.", flush=True)
+                    print(f"{'='*60}\n", flush=True)
+
             return None
 
     async def check_pending_orders(self):
-        """Check if pending orders have been filled and cancel stale ones."""
+        """Check if pending orders have been filled, partially filled, or need cancellation."""
         if not self.is_ready:
             return
 
@@ -337,26 +444,46 @@ class LiveTrader:
                 clob_order = self.clob_client.get_order(order_id)
                 if clob_order:
                     status = clob_order.get('status', '').lower()
+
                     if status in ('matched', 'filled'):
-                        order['status'] = 'open'
+                        # Fully filled
                         fill_price = float(clob_order.get('price', order['entry_price']))
+                        fill_size = float(clob_order.get('size_matched', order.get('shares', 0)))
+                        order['status'] = 'open'
                         order['entry_price'] = fill_price
+                        if fill_size > 0:
+                            order['shares'] = fill_size
                         self.positions[trade_id] = order
                         to_remove.append(trade_id)
                         print(f"🟢 FILLED: {order['coin']} {order['direction']} "
-                              f"@ ${fill_price:.3f}", flush=True)
+                              f"@ ${fill_price:.3f} ({fill_size:.1f} shares)", flush=True)
                         continue
+
                     elif status == 'cancelled':
                         to_remove.append(trade_id)
                         self.balance_mgr.open_positions = max(0, self.balance_mgr.open_positions - 1)
                         self.balance_mgr.update_balance(
                             self.balance_mgr.balance + order['size_usd']
                         )
+                        print(f"❌ CANCELLED externally: {order['coin']} {order['direction']}", flush=True)
                         continue
+
+                    elif status == 'live':
+                        # Still in the book — check for partial fills
+                        size_matched = float(clob_order.get('size_matched', 0))
+                        original_size = order.get('shares', 0)
+                        if size_matched > 0 and size_matched < original_size:
+                            # Partial fill — log it but keep waiting
+                            fill_pct = size_matched / original_size * 100 if original_size > 0 else 0
+                            if not order.get('_partial_logged'):
+                                print(f"⏳ PARTIAL: {order['coin']} {order['direction']} "
+                                      f"{fill_pct:.0f}% filled ({size_matched:.1f}/{original_size:.1f})",
+                                      flush=True)
+                                order['_partial_logged'] = True
             except Exception:
                 pass
 
-            # Timeout
+            # Timeout: cancel and recover balance
             if now - placed_at > self.ORDER_TIMEOUT:
                 try:
                     self.clob_client.cancel(order_id)
