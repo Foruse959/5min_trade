@@ -158,7 +158,7 @@ class LiveTrader:
                 print(f"⚠️ Fee rate fetch failed, using default: {e}", flush=True)
 
             # Step 5: Check actual balance
-            real_balance = await self._fetch_live_balance()
+            real_balance = await self.fetch_balance()
             if real_balance is not None:
                 if real_balance < 0.50:
                     print(f"\n{'='*60}", flush=True)

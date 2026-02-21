@@ -123,7 +123,7 @@ class TradingEngine:
             if blocked:
                 print(f"🚫 GEOBLOCKED! IP: {ip} | Country: {country} | Region: {region}", flush=True)
                 print(f"⚠️ Orders will be REJECTED. Change Railway region to a non-blocked country.", flush=True)
-                print(f"   Blocked: US, UK, DE, FR, IT, AU, SG, etc. Safe: NL, IN, JP, BR, KR", flush=True)
+                print(f"   Blocked: US, UK, DE, FR, IT, AU, SG, NL, etc. Try: IN, JP, BR, KR", flush=True)
             else:
                 print(f"✅ Geoblock OK — IP: {ip} | Country: {country} | Region: {region}", flush=True)
         except Exception as e:
