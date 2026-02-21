@@ -25,10 +25,10 @@ class Config:
     # ═══════════════════════════════════════════════════════════════════
     POLY_PRIVATE_KEY = os.getenv('POLY_PRIVATE_KEY', '')
     POLY_SAFE_ADDRESS = os.getenv('POLY_SAFE_ADDRESS', '')
-    POLY_FUNDER_ADDRESS = os.getenv('POLY_FUNDER_ADDRESS', '')
-    POLY_API_KEY = os.getenv('POLY_API_KEY', '')
-    POLY_API_SECRET = os.getenv('POLY_API_SECRET', '')
-    POLY_PASSPHRASE = os.getenv('POLY_PASSPHRASE', '')
+    POLY_FUNDER_ADDRESS = os.getenv('POLY_FUNDER_ADDRESS', '')  # Auto-derived if blank
+    POLY_API_KEY = os.getenv('POLY_API_KEY', '')      # Auto-derived from private key
+    POLY_API_SECRET = os.getenv('POLY_API_SECRET', '')  # Auto-derived from private key
+    POLY_PASSPHRASE = os.getenv('POLY_PASSPHRASE', '')  # Auto-derived from private key
     POLY_SIGNATURE_TYPE = int(os.getenv('POLY_SIGNATURE_TYPE', '0'))  # 0=EOA, 1=Magic
     POLY_CHAIN_ID = int(os.getenv('POLY_CHAIN_ID', '137'))  # Polygon mainnet
 
@@ -154,6 +154,37 @@ class Config:
         return cls.TRADING_MODE.lower() == 'paper'
 
     @classmethod
+    def is_live_ready(cls) -> bool:
+        """Check if minimum live trading config is set (just private key)."""
+        pk = cls.POLY_PRIVATE_KEY.strip() if cls.POLY_PRIVATE_KEY else ''
+        return bool(pk)
+
+    @classmethod
+    def derive_wallet_address(cls) -> str:
+        """Derive wallet address from private key. Returns '' on failure."""
+        pk = cls.POLY_PRIVATE_KEY.strip() if cls.POLY_PRIVATE_KEY else ''
+        if not pk:
+            return ''
+        try:
+            from eth_account import Account
+            if not pk.startswith('0x'):
+                pk = '0x' + pk
+            wallet = Account.from_key(pk)
+            return wallet.address
+        except Exception:
+            return ''
+
+    @classmethod
+    def get_funder_address(cls) -> str:
+        """Get funder address — uses explicit config or auto-derives from key."""
+        if cls.POLY_FUNDER_ADDRESS and cls.POLY_FUNDER_ADDRESS.strip():
+            return cls.POLY_FUNDER_ADDRESS.strip()
+        # Auto-derive for EOA wallets (signature_type=0)
+        if cls.POLY_SIGNATURE_TYPE == 0:
+            return cls.derive_wallet_address()
+        return ''
+
+    @classmethod
     def is_configured(cls) -> bool:
         return bool(cls.TELEGRAM_BOT_TOKEN)
 
@@ -164,13 +195,25 @@ class Config:
     @classmethod
     def print_status(cls):
         mode = '📋 PAPER' if cls.is_paper() else '🔴 LIVE'
-        print(f"\n{'='*50}")
-        print(f"⚡ 5MIN_TRADE — Polymarket Crypto Scalper")
-        print(f"{'='*50}")
-        print(f"Mode: {mode}")
-        print(f"Coins: {', '.join(cls.ENABLED_COINS)}")
-        print(f"Timeframes: {cls.ENABLED_TIMEFRAMES}")
-        print(f"Telegram: {'✅' if cls.TELEGRAM_BOT_TOKEN else '❌'}")
-        print(f"Wallet: {'✅' if cls.POLY_PRIVATE_KEY else '❌ (paper only)'}")
-        print(f"Balance: ${cls.STARTING_BALANCE:.2f}")
-        print(f"{'='*50}\n")
+        pk_ok = bool(cls.POLY_PRIVATE_KEY and cls.POLY_PRIVATE_KEY.strip())
+        wallet = cls.derive_wallet_address() if pk_ok else ''
+        funder = cls.get_funder_address()
+        api_auto = not bool(cls.POLY_API_KEY and cls.POLY_API_KEY.strip())
+
+        print(f"\n{'='*60}", flush=True)
+        print(f"⚡ 5MIN_TRADE — Polymarket Crypto Scalper", flush=True)
+        print(f"{'='*60}", flush=True)
+        print(f"Mode: {mode}", flush=True)
+        print(f"Coins: {', '.join(cls.ENABLED_COINS)}", flush=True)
+        print(f"Timeframes: {cls.ENABLED_TIMEFRAMES}", flush=True)
+        print(f"Telegram: {'✅' if cls.TELEGRAM_BOT_TOKEN else '❌'}", flush=True)
+        print(f"{'─'*60}", flush=True)
+        print(f"🔐 LIVE TRADING CONFIG:", flush=True)
+        print(f"  Private Key: {'✅ set' if pk_ok else '❌ NOT SET — set POLY_PRIVATE_KEY'}", flush=True)
+        if pk_ok:
+            print(f"  Wallet: {wallet[:8]}...{wallet[-4:]}" if wallet else "  Wallet: ❌ could not derive", flush=True)
+            print(f"  Funder: {funder[:8]}...{funder[-4:]}" if funder else "  Funder: ⚠️ not set (required for proxy wallets)", flush=True)
+            print(f"  API Creds: {'🔑 auto-derive from key' if api_auto else '✅ manually set'}", flush=True)
+            print(f"  Sig Type: {cls.POLY_SIGNATURE_TYPE} ({'EOA/MetaMask' if cls.POLY_SIGNATURE_TYPE == 0 else 'Email/Magic' if cls.POLY_SIGNATURE_TYPE == 1 else 'Proxy'})", flush=True)
+        print(f"Balance: ${cls.STARTING_BALANCE:.2f}", flush=True)
+        print(f"{'='*60}\n", flush=True)

@@ -56,10 +56,16 @@ class LiveTrader:
         - signature_type=1: Email/Magic wallet
         - signature_type=2: Browser proxy wallet
         - funder: address holding funds (required for proxy wallets, optional for EOA)
+        
+        Only POLY_PRIVATE_KEY is required. API credentials (key/secret/passphrase)
+        are auto-derived from the private key via create_or_derive_api_creds().
+        Funder address is auto-derived from private key for EOA wallets.
         """
         private_key = Config.POLY_PRIVATE_KEY
         if not private_key:
             print("⚠️ No POLY_PRIVATE_KEY set — live trading disabled", flush=True)
+            print("  To enable live trading, set POLY_PRIVATE_KEY in Railway env vars", flush=True)
+            print("  Format: 0x followed by 64 hex characters (from MetaMask)", flush=True)
             return False
 
         # Validate key format
@@ -79,16 +85,19 @@ class LiveTrader:
             host = Config.CLOB_API_URL
             chain_id = Config.POLY_CHAIN_ID  # 137 = Polygon
             sig_type = Config.POLY_SIGNATURE_TYPE  # 0=EOA, 1=Magic, 2=Proxy
-            funder = Config.POLY_FUNDER_ADDRESS.strip() if Config.POLY_FUNDER_ADDRESS else None
 
-            # If funder is empty string, set to None
-            if funder == '':
+            # Auto-derive funder address if not explicitly set
+            funder = Config.get_funder_address()
+            if not funder:
                 funder = None
 
             print(f"  Host: {host}", flush=True)
             print(f"  Chain: {chain_id}", flush=True)
             print(f"  Sig type: {sig_type} ({'EOA' if sig_type == 0 else 'Magic' if sig_type == 1 else 'Proxy'})", flush=True)
-            print(f"  Funder: {funder or '(none - using EOA address)'}", flush=True)
+            if funder:
+                print(f"  Funder: {funder[:8]}...{funder[-4:]}", flush=True)
+            else:
+                print(f"  Funder: (none — EOA mode, using signing address)", flush=True)
 
             # Step 1: Create client
             self.clob_client = ClobClient(
@@ -100,6 +109,8 @@ class LiveTrader:
             )
 
             # Step 2: Set or derive API credentials
+            # NOTE: POLY_API_KEY/SECRET/PASSPHRASE are auto-derived from your private key.
+            # You do NOT need to set them manually. Leave them blank in Railway.
             if Config.POLY_API_KEY and Config.POLY_API_KEY.strip():
                 creds = ApiCreds(
                     api_key=Config.POLY_API_KEY.strip(),
@@ -107,16 +118,18 @@ class LiveTrader:
                     api_passphrase=Config.POLY_PASSPHRASE.strip(),
                 )
                 self.clob_client.set_api_creds(creds)
-                print(f"🔑 Using provided API credentials", flush=True)
+                print(f"🔑 Using manually provided API credentials", flush=True)
             else:
-                print(f"🔑 Deriving API credentials from private key...", flush=True)
+                print(f"🔑 Auto-deriving API credentials from private key...", flush=True)
                 try:
                     derived = self.clob_client.create_or_derive_api_creds()
                     self.clob_client.set_api_creds(derived)
                     print(f"✅ API credentials derived successfully", flush=True)
+                    print(f"  ℹ️  POLY_API_KEY/SECRET/PASSPHRASE are NOT needed — they are auto-derived!", flush=True)
                 except Exception as e:
                     print(f"❌ Failed to derive API creds: {e}", flush=True)
-                    print(f"  You may need to set POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE manually", flush=True)
+                    print(f"  This usually means the private key is invalid or the CLOB API is down.", flush=True)
+                    print(f"  If this persists, try setting POLY_API_KEY, POLY_API_SECRET, POLY_PASSPHRASE manually.", flush=True)
                     return False
 
             # Step 3: Test connection

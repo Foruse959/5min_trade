@@ -421,13 +421,12 @@ class TelegramBot:
         if not self.engine.live_trader.is_ready:
             await update.message.reply_text(
                 "❌ Live trading not configured!\n\n"
-                "You need POLY_PRIVATE_KEY in your .env file.\n"
-                "Seed mode requires live trading to work.\n\n"
-                "Set these in .env:\n"
-                "  POLY_PRIVATE_KEY=your_key\n"
-                "  POLY_API_KEY=your_api_key\n"
-                "  POLY_API_SECRET=your_secret\n"
-                "  POLY_PASSPHRASE=your_passphrase"
+                "Set POLY_PRIVATE_KEY in Railway environment variables.\n"
+                "(0x + 64 hex chars from MetaMask)\n\n"
+                "⚠️ POLY_API_KEY/SECRET/PASSPHRASE are NOT needed —\n"
+                "they are auto-derived from your private key!\n\n"
+                "Then redeploy. Check logs for:\n"
+                "✅ Live trader initialized successfully"
             )
             return
 
@@ -660,7 +659,10 @@ class TelegramBot:
 
         if data == 'mode_na':
             await query.edit_message_text(
-                "❌ Live trading requires POLY_PRIVATE_KEY in .env"
+                "❌ Live trading not configured\n\n"
+                "Set POLY_PRIVATE_KEY in Railway env vars.\n"
+                "API_KEY/SECRET/PASSPHRASE are auto-derived — leave them blank!\n\n"
+                "Then redeploy."
             )
             return
 
