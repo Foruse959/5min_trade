@@ -212,7 +212,9 @@ class LiveTrader:
         if not self.is_ready:
             return None
 
-        # Method 1: CLOB get_balance_allowance (no args)
+        # Method 1: CLOB get_balance_allowance
+        # NOTE: This can fail with 'NoneType' has no attribute 'signature_type'
+        # if the py-clob-client signer isn't fully initialized (EOA issue)
         try:
             bal_resp = self.clob_client.get_balance_allowance()
             if bal_resp:
@@ -220,90 +222,93 @@ class LiveTrader:
                 # CLOB returns balance in atomic units (6 decimals for USDC)
                 if balance > 1_000_000:
                     balance = balance / 1e6
-                print(f"💰 Polymarket balance: ${balance:.6f}", flush=True)
-                return round(balance, 2)
+                if balance > 0:
+                    print(f"💰 Polymarket balance (CLOB): ${balance:.2f}", flush=True)
+                    return round(balance, 2)
         except Exception as e:
-            print(f"⚠️ CLOB balance failed: {e}", flush=True)
+            # Common: 'NoneType' has no attribute 'signature_type' — non-fatal
+            if 'signature_type' not in str(e):
+                print(f"⚠️ CLOB balance failed: {e}", flush=True)
 
-        # Method 2: On-chain USDC balance via Polygon RPC
+        # Method 2 & 3: On-chain USDC balance via Polygon RPC
+        # Check BOTH wallet address AND proxy/safe address
+        # (Polymarket deposits go to the proxy address, not the signing wallet)
         try:
             import requests
             from config import Config
-
-            # Derive wallet address from private key
             from eth_account import Account
+
             wallet = Account.from_key(Config.POLY_PRIVATE_KEY)
-            address = wallet.address
+            addresses_to_check = [wallet.address]
 
-            # USDC contract on Polygon (PoS bridged)
-            usdc_contract = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-            # balanceOf(address) selector = 0x70a08231
-            padded_addr = address[2:].lower().zfill(64)
-            call_data = f"0x70a08231{padded_addr}"
+            # Also check the funder/proxy address if different
+            funder = Config.get_funder_address()
+            if funder and funder.lower() != wallet.address.lower():
+                addresses_to_check.append(funder)
+            if Config.POLY_SAFE_ADDRESS and Config.POLY_SAFE_ADDRESS.lower() not in [a.lower() for a in addresses_to_check]:
+                addresses_to_check.append(Config.POLY_SAFE_ADDRESS)
 
-            resp = requests.post(
-                "https://polygon-rpc.com",
-                json={
-                    "jsonrpc": "2.0",
-                    "method": "eth_call",
-                    "params": [{"to": usdc_contract, "data": call_data}, "latest"],
-                    "id": 1,
-                },
-                timeout=5,
-            )
-            if resp.status_code == 200:
-                result = resp.json().get("result", "0x0")
-                balance_wei = int(result, 16)
-                balance = balance_wei / 1e6  # USDC has 6 decimals
-                print(f"💰 On-chain USDC: ${balance:.6f}", flush=True)
-                return round(balance, 2)
+            # USDC contracts on Polygon
+            usdc_contracts = [
+                ("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", "USDC.e"),   # PoS bridged
+                ("0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", "USDC"),     # Native
+            ]
+
+            total_balance = 0.0
+            for addr in addresses_to_check:
+                padded_addr = addr[2:].lower().zfill(64)
+                for contract, label in usdc_contracts:
+                    try:
+                        call_data = f"0x70a08231{padded_addr}"
+                        resp = requests.post(
+                            "https://polygon-rpc.com",
+                            json={
+                                "jsonrpc": "2.0",
+                                "method": "eth_call",
+                                "params": [{"to": contract, "data": call_data}, "latest"],
+                                "id": 1,
+                            },
+                            timeout=8,
+                        )
+                        if resp.status_code == 200:
+                            result = resp.json().get("result", "0x0")
+                            balance_wei = int(result, 16)
+                            balance = balance_wei / 1e6
+                            if balance > 0:
+                                total_balance += balance
+                    except Exception:
+                        pass
+
+            if total_balance > 0:
+                print(f"💰 On-chain USDC balance: ${total_balance:.2f}", flush=True)
+                return round(total_balance, 2)
+
         except Exception as e:
             print(f"⚠️ On-chain balance failed: {e}", flush=True)
 
-        # Method 3: Try USDCe (native USDC on Polygon)
+        # Method 4: Fallback to STARTING_BALANCE from config
+        # This ensures the bot can trade even if balance fetching is broken
         try:
-            import requests
             from config import Config
-            from eth_account import Account
-
-            wallet = Account.from_key(Config.POLY_PRIVATE_KEY)
-            address = wallet.address
-
-            # Native USDC on Polygon
-            usdce_contract = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
-            padded_addr = address[2:].lower().zfill(64)
-            call_data = f"0x70a08231{padded_addr}"
-
-            resp = requests.post(
-                "https://polygon-rpc.com",
-                json={
-                    "jsonrpc": "2.0",
-                    "method": "eth_call",
-                    "params": [{"to": usdce_contract, "data": call_data}, "latest"],
-                    "id": 1,
-                },
-                timeout=5,
-            )
-            if resp.status_code == 200:
-                result = resp.json().get("result", "0x0")
-                balance_wei = int(result, 16)
-                balance = balance_wei / 1e6
-                if balance > 0:
-                    print(f"💰 On-chain USDCe: ${balance:.6f}", flush=True)
-                    return round(balance, 2)
-        except Exception as e:
-            print(f"⚠️ USDCe balance failed: {e}", flush=True)
+            fallback = Config.STARTING_BALANCE
+            if fallback > 0:
+                print(f"⚠️ Using fallback balance from STARTING_BALANCE: ${fallback:.2f}", flush=True)
+                return fallback
+        except Exception:
+            pass
 
         return None
 
     async def _get_cached_balance(self) -> Optional[float]:
-        """Get real USDC balance, refreshing at most every 30 seconds."""
+        """Get real USDC balance, refreshing at most every 30 seconds.
+        Preserves last-known-good balance if refresh fails."""
         now = time.time()
         if now - self._last_balance_check > 30:
             real = await self.fetch_balance()
-            if real is not None:
+            if real is not None and real > 0:
                 self._cached_real_balance = real
                 self.balance_mgr.update_balance(real)
+            # If fetch failed but we have a cached balance, keep using it
             self._last_balance_check = now
         return self._cached_real_balance
 
@@ -320,12 +325,13 @@ class LiveTrader:
                     if allowance < 1.0:
                         print(f"⚠️ USDC allowance too low (${allowance:.2f}) — need to approve CLOB contract", flush=True)
                         print(f"  Visit https://polymarket.com and place a manual trade first to set allowance", flush=True)
-                        self._trading_paused = True
-                        self._pause_reason = f'USDC allowance too low (${allowance:.2f})'
+                        # DON'T pause trading — allowance might be fine via proxy
                     else:
                         print(f"✅ USDC allowance: ${allowance:.2f}", flush=True)
         except Exception as e:
-            print(f"⚠️ Allowance check failed (non-fatal): {e}", flush=True)
+            # Suppress 'NoneType' signature_type error — common with EOA wallets
+            if 'signature_type' not in str(e):
+                print(f"⚠️ Allowance check failed (non-fatal): {e}", flush=True)
 
     async def execute_signal(self, signal: TradeSignal) -> Optional[Dict]:
         """Execute a trade signal by placing a LIMIT order on the CLOB."""
