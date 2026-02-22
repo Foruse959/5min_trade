@@ -52,6 +52,7 @@ class LiveTrader:
         # Cached real balance (refreshed every 30s to avoid RPC spam)
         self._cached_real_balance: Optional[float] = None
         self._last_balance_check: float = 0.0
+        self._sig_type: int = 0  # 0=EOA, 1=Magic, 2=Proxy
 
     async def init(self):
         """Initialize CLOB client with credentials.
@@ -107,6 +108,7 @@ class LiveTrader:
                 print(f"  Funder: (none — EOA mode, using signing address)", flush=True)
 
             # Step 1: Create client
+            self._sig_type = sig_type  # Store for balance/allowance queries
             self.clob_client = ClobClient(
                 host,
                 key=private_key,
@@ -213,10 +215,15 @@ class LiveTrader:
             return None
 
         # Method 1: CLOB get_balance_allowance
-        # NOTE: This can fail with 'NoneType' has no attribute 'signature_type'
-        # if the py-clob-client signer isn't fully initialized (EOA issue)
+        # Must pass explicit BalanceAllowanceParams to avoid NoneType crash
+        # (py-clob-client bug: params=None causes params.signature_type to fail)
         try:
-            bal_resp = self.clob_client.get_balance_allowance()
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                signature_type=self._sig_type,  # 0 for EOA
+            )
+            bal_resp = self.clob_client.get_balance_allowance(params)
             if bal_resp:
                 balance = float(bal_resp.get('balance', 0))
                 # CLOB returns balance in atomic units (6 decimals for USDC)
@@ -225,10 +232,10 @@ class LiveTrader:
                 if balance > 0:
                     print(f"💰 Polymarket balance (CLOB): ${balance:.2f}", flush=True)
                     return round(balance, 2)
+                else:
+                    print(f"⚠️ CLOB reports $0 balance", flush=True)
         except Exception as e:
-            # Common: 'NoneType' has no attribute 'signature_type' — non-fatal
-            if 'signature_type' not in str(e):
-                print(f"⚠️ CLOB balance failed: {e}", flush=True)
+            print(f"⚠️ CLOB balance failed: {e}", flush=True)
 
         # Method 2 & 3: On-chain USDC balance via Polygon RPC
         # Check BOTH wallet address AND proxy/safe address
@@ -315,7 +322,12 @@ class LiveTrader:
     async def _check_allowance(self):
         """Check if USDC allowance is sufficient for trading."""
         try:
-            bal_resp = self.clob_client.get_balance_allowance()
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                signature_type=self._sig_type,
+            )
+            bal_resp = self.clob_client.get_balance_allowance(params)
             if bal_resp:
                 allowance_raw = bal_resp.get('allowance', None)
                 if allowance_raw is not None:
@@ -325,13 +337,10 @@ class LiveTrader:
                     if allowance < 1.0:
                         print(f"⚠️ USDC allowance too low (${allowance:.2f}) — need to approve CLOB contract", flush=True)
                         print(f"  Visit https://polymarket.com and place a manual trade first to set allowance", flush=True)
-                        # DON'T pause trading — allowance might be fine via proxy
                     else:
                         print(f"✅ USDC allowance: ${allowance:.2f}", flush=True)
         except Exception as e:
-            # Suppress 'NoneType' signature_type error — common with EOA wallets
-            if 'signature_type' not in str(e):
-                print(f"⚠️ Allowance check failed (non-fatal): {e}", flush=True)
+            print(f"⚠️ Allowance check failed (non-fatal): {e}", flush=True)
 
     async def execute_signal(self, signal: TradeSignal) -> Optional[Dict]:
         """Execute a trade signal by placing a LIMIT order on the CLOB."""
