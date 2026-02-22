@@ -211,145 +211,92 @@ class LiveTrader:
 
         Polymarket uses OFF-CHAIN internal balances:
         - On-chain USDC ≠ trading balance
-        - Must query CLOB API with signed auth
+        - Must sync via update_balance_allowance() first
+        - Then read via get_balance_allowance()
 
         Methods (in order):
-        1. GET /balance (L1 EIP-712 auth) → {available, locked, withdrawable}
-        2. GET /balance-allowance (L2 HMAC auth) → collateral balance
+        1. CLOB: update_balance_allowance → get_balance_allowance (L2 auth)
+        2. Data API: GET /value?user={address} (total portfolio value)
         3. On-chain USDC (Polygon RPC) → wallet + proxy addresses
         4. STARTING_BALANCE config fallback
         """
         if not self.is_ready:
             return None
 
-        # ═══ Method 1: GET /balance with L1 EIP-712 auth ═══
-        # This is the CORRECT endpoint — returns available trading balance
-        try:
-            import requests
-            from config import Config
-
-            # Use py-clob-client's internal L1 header generation
-            from py_clob_client.headers.headers import create_level_1_headers
-            headers = create_level_1_headers(self.clob_client.signer)
-
-            url = f"{Config.CLOB_API_URL}/balance"
-            resp = requests.get(url, headers=headers, timeout=10)
-
-            if resp.status_code == 200:
-                data = resp.json()
-                # Response: {"available": "4.00", "locked": "0.00", "withdrawable": "4.00"}
-                available = float(data.get('available', data.get('balance', 0)))
-                locked = float(data.get('locked', 0))
-                withdrawable = float(data.get('withdrawable', 0))
-
-                # CLOB might return in atomic units
-                if available > 1_000_000:
-                    available = available / 1e6
-                if locked > 1_000_000:
-                    locked = locked / 1e6
-
-                print(f"💰 Polymarket balance: available=${available:.2f}, "
-                      f"locked=${locked:.2f}, withdrawable=${withdrawable:.2f}", flush=True)
-                if available > 0:
-                    return round(available, 2)
-                # If available is 0, it's genuinely 0 — continue to fallbacks
-            else:
-                print(f"⚠️ GET /balance: HTTP {resp.status_code} — {resp.text[:200]}", flush=True)
-        except ImportError:
-            print(f"⚠️ L1 headers not available, trying fallback", flush=True)
-        except Exception as e:
-            print(f"⚠️ GET /balance failed: {e}", flush=True)
-
-        # ═══ Method 2: Manual EIP-712 signed GET /balance ═══
-        # Fallback if py-clob-client L1 headers aren't available
-        try:
-            import requests
-            from config import Config
-            from eth_account import Account
-            from eth_account.messages import encode_structured_data
-
-            wallet = Account.from_key(Config.POLY_PRIVATE_KEY)
-            timestamp = str(int(time.time()))
-            nonce = 0
-
-            # EIP-712 structured data for CLOB auth
-            structured_data = {
-                "types": {
-                    "EIP712Domain": [
-                        {"name": "name", "type": "string"},
-                        {"name": "version", "type": "string"},
-                        {"name": "chainId", "type": "uint256"},
-                    ],
-                    "ClobAuth": [
-                        {"name": "address", "type": "address"},
-                        {"name": "timestamp", "type": "string"},
-                        {"name": "nonce", "type": "uint256"},
-                        {"name": "message", "type": "string"},
-                    ],
-                },
-                "primaryType": "ClobAuth",
-                "domain": {
-                    "name": "ClobAuthDomain",
-                    "version": "1",
-                    "chainId": Config.POLY_CHAIN_ID,
-                },
-                "message": {
-                    "address": wallet.address,
-                    "timestamp": timestamp,
-                    "nonce": nonce,
-                    "message": "This message attests that I control the given wallet",
-                },
-            }
-
-            signable = encode_structured_data(structured_data)
-            signed = wallet.sign_message(signable)
-            signature = signed.signature.hex()
-            if not signature.startswith("0x"):
-                signature = "0x" + signature
-
-            headers = {
-                "POLY_ADDRESS": wallet.address,
-                "POLY_SIGNATURE": signature,
-                "POLY_TIMESTAMP": timestamp,
-                "POLY_NONCE": str(nonce),
-            }
-
-            url = f"{Config.CLOB_API_URL}/balance"
-            resp = requests.get(url, headers=headers, timeout=10)
-
-            if resp.status_code == 200:
-                data = resp.json()
-                available = float(data.get('available', data.get('balance', 0)))
-                locked = float(data.get('locked', 0))
-
-                if available > 1_000_000:
-                    available = available / 1e6
-
-                print(f"💰 Balance (EIP-712): available=${available:.2f}, locked=${locked:.2f}", flush=True)
-                if available > 0:
-                    return round(available, 2)
-            else:
-                print(f"⚠️ EIP-712 /balance: HTTP {resp.status_code} — {resp.text[:200]}", flush=True)
-        except Exception as e:
-            print(f"⚠️ EIP-712 balance failed: {e}", flush=True)
-
-        # ═══ Method 3: GET /balance-allowance with proper params ═══
+        # ═══ Method 1: Sync then read CLOB balance ═══
+        # Step 1a: Call update_balance_allowance to sync on-chain deposit → CLOB ledger
+        # Step 1b: Call get_balance_allowance to read the synced balance
         try:
             from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
             params = BalanceAllowanceParams(
                 asset_type=AssetType.COLLATERAL,
-                signature_type=self._sig_type,
+                signature_type=self._sig_type,  # 0 for EOA
             )
+
+            # SYNC: Tell the CLOB to refresh balance from on-chain
+            try:
+                sync_resp = self.clob_client.update_balance_allowance(params)
+                if sync_resp:
+                    print(f"🔄 Balance synced with CLOB: {sync_resp}", flush=True)
+            except Exception as e:
+                print(f"⚠️ Balance sync failed (non-fatal): {e}", flush=True)
+
+            # READ: Now get the (hopefully updated) balance
             bal_resp = self.clob_client.get_balance_allowance(params)
             if bal_resp:
                 balance = float(bal_resp.get('balance', 0))
+                allowance = float(bal_resp.get('allowance', 0))
+                # CLOB returns balance in atomic units (6 decimals for USDC)
                 if balance > 1_000_000:
                     balance = balance / 1e6
+                if allowance > 1_000_000:
+                    allowance = allowance / 1e6
+                print(f"💰 CLOB balance: ${balance:.2f} (allowance: ${allowance:.2f})", flush=True)
                 if balance > 0:
-                    print(f"💰 CLOB allowance: ${balance:.2f}", flush=True)
                     return round(balance, 2)
         except Exception as e:
-            pass  # Already tried, don't spam logs
+            print(f"⚠️ CLOB balance failed: {e}", flush=True)
+
+        # ═══ Method 2: Polymarket Data API ═══
+        # GET https://data-api.polymarket.com/value?user={address}
+        # Returns total portfolio value (cash + positions)
+        try:
+            import requests
+            from eth_account import Account
+            from config import Config
+
+            wallet = Account.from_key(Config.POLY_PRIVATE_KEY)
+            address = wallet.address.lower()
+
+            # Try the data API for portfolio value
+            resp = requests.get(
+                f"https://data-api.polymarket.com/value",
+                params={"user": address},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                # Could be a number or dict
+                if isinstance(data, (int, float)):
+                    value = float(data)
+                elif isinstance(data, dict):
+                    value = float(data.get('value', data.get('balance', 0)))
+                elif isinstance(data, str):
+                    value = float(data)
+                else:
+                    value = 0.0
+
+                if value > 1_000_000:
+                    value = value / 1e6
+                if value > 0:
+                    print(f"💰 Data API portfolio value: ${value:.2f}", flush=True)
+                    return round(value, 2)
+                else:
+                    print(f"⚠️ Data API: portfolio value = $0", flush=True)
+            else:
+                print(f"⚠️ Data API: HTTP {resp.status_code}", flush=True)
+        except Exception as e:
+            print(f"⚠️ Data API failed: {e}", flush=True)
 
         # Method 2 & 3: On-chain USDC balance via Polygon RPC
         # Check BOTH wallet address AND proxy/safe address
