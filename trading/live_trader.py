@@ -11,6 +11,7 @@ Uses py-clob-client to place real orders on Polymarket.
 IMPORTANT: This trades REAL money. Start with $5-10 max.
 """
 
+import os
 import uuid
 import time
 import math
@@ -233,13 +234,26 @@ class LiveTrader:
             wallet_address = wallet.address
             print(f"🔍 Checking balances for wallet: {wallet_address}", flush=True)
 
-            # Addresses to check (wallet is primary, funder/safe if configured)
+            # Addresses to check (wallet + proxy/funder/safe)
             addresses_to_check = [(wallet_address, "wallet")]
-            funder = Config.get_funder_address()
-            if funder and funder.lower() != wallet_address.lower():
-                addresses_to_check.append((funder, "funder"))
-            if Config.POLY_SAFE_ADDRESS and Config.POLY_SAFE_ADDRESS.lower() not in [a.lower() for a, _ in addresses_to_check]:
-                addresses_to_check.append((Config.POLY_SAFE_ADDRESS, "safe"))
+
+            # Polymarket proxy wallet — this is where your actual funds live
+            proxy_wallet = os.environ.get("POLY_PROXY_WALLET", "").strip()
+            if proxy_wallet and proxy_wallet.lower() != wallet_address.lower():
+                addresses_to_check.insert(0, (proxy_wallet, "proxy"))  # Check proxy FIRST
+
+            # Also check funder/safe if configured
+            try:
+                funder = Config.get_funder_address()
+                if funder and funder.lower() not in [a.lower() for a, _ in addresses_to_check]:
+                    addresses_to_check.append((funder, "funder"))
+            except Exception:
+                pass
+            try:
+                if Config.POLY_SAFE_ADDRESS and Config.POLY_SAFE_ADDRESS.lower() not in [a.lower() for a, _ in addresses_to_check]:
+                    addresses_to_check.append((Config.POLY_SAFE_ADDRESS, "safe"))
+            except Exception:
+                pass
 
             # USDC contracts on Polygon (official: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174)
             usdc_contracts = [
@@ -268,6 +282,7 @@ class LiveTrader:
                             call_data = f"0x70a08231{padded_addr}"
                             resp = requests.post(
                                 rpc_url,
+                                headers={"Content-Type": "application/json"},
                                 json={
                                     "jsonrpc": "2.0",
                                     "method": "eth_call",
