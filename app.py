@@ -60,9 +60,10 @@ class TradingEngine:
         self.risk_manager = RiskManager()
         self.paper_trader = PaperTrader(self.db, self.risk_manager)
 
-        # Live trading
+        # Live trading — start with $0 balance; real balance fetched from Polymarket on init
+        # STARTING_BALANCE is ONLY used for paper trading, never for live
         self.live_balance_mgr = LiveBalanceManager(
-            balance=Config.STARTING_BALANCE,
+            balance=0.0,  # Will be synced to real USDC balance on init()
             mode=Config.LIVE_RISK_MODE,
         )
         self.live_trader = LiveTrader(self.db, self.live_balance_mgr)
