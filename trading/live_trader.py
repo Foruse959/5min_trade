@@ -237,6 +237,59 @@ class LiveTrader:
         except Exception as e:
             print(f"⚠️ CLOB balance failed: {e}", flush=True)
 
+        # Method 2: Direct CLOB REST API with L2 HMAC auth
+        # Bypasses py-clob-client library entirely — calls /balance-allowance with HMAC headers
+        try:
+            import requests
+            import hmac
+            import hashlib
+            import base64
+            from config import Config
+
+            if self.clob_client and self.clob_client.creds:
+                api_key = self.clob_client.creds.api_key
+                api_secret = self.clob_client.creds.api_secret
+                api_passphrase = self.clob_client.creds.api_passphrase
+
+                timestamp = str(int(time.time()))
+                method = "GET"
+                request_path = "/balance-allowance"
+                body = ""
+
+                # Build HMAC-SHA256 signature (Polymarket L2 auth)
+                message = timestamp + method + request_path + body
+                hmac_key = base64.b64decode(api_secret)
+                signature = base64.b64encode(
+                    hmac.new(hmac_key, message.encode('utf-8'), hashlib.sha256).digest()
+                ).decode('utf-8')
+
+                headers = {
+                    "POLY_ADDRESS": self.clob_client.get_address() or "",
+                    "POLY_SIGNATURE": signature,
+                    "POLY_TIMESTAMP": timestamp,
+                    "POLY_API_KEY": api_key,
+                    "POLY_PASSPHRASE": api_passphrase,
+                }
+
+                url = f"{Config.CLOB_API_URL}{request_path}"
+                url += f"?asset_type=COLLATERAL&signature_type={self._sig_type}"
+
+                resp = requests.get(url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    balance = float(data.get('balance', 0))
+                    if balance > 1_000_000:
+                        balance = balance / 1e6
+                    if balance > 0:
+                        print(f"💰 Polymarket balance (REST): ${balance:.2f}", flush=True)
+                        return round(balance, 2)
+                    else:
+                        print(f"⚠️ REST API reports $0 balance", flush=True)
+                else:
+                    print(f"⚠️ CLOB REST balance: HTTP {resp.status_code} — {resp.text[:100]}", flush=True)
+        except Exception as e:
+            print(f"⚠️ CLOB REST balance failed: {e}", flush=True)
+
         # Method 2 & 3: On-chain USDC balance via Polygon RPC
         # Check BOTH wallet address AND proxy/safe address
         # (Polymarket deposits go to the proxy address, not the signing wallet)
