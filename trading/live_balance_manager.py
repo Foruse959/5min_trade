@@ -144,6 +144,10 @@ class LiveBalanceManager:
             return False, f"📊 {self.open_positions}/{self.max_positions} positions open"
         return True, f"{self.mode.emoji} {self.mode.name}"
 
+    def can_afford_dual_leg(self) -> bool:
+        """Check if balance supports a dual-leg trade (2× minimum per leg)."""
+        return self.tradeable_balance >= Config.POLYMARKET_MIN_ORDER_SIZE * 2
+
     def get_position_size(self, confidence: float) -> float:
         """
         Calculate position size. Dynamic based on balance, mode, and confidence.

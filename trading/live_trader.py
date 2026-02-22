@@ -13,6 +13,7 @@ IMPORTANT: This trades REAL money. Start with $5-10 max.
 
 import uuid
 import time
+import math
 import asyncio
 from typing import Dict, List, Optional
 from datetime import datetime
@@ -48,6 +49,9 @@ class LiveTrader:
         self._trading_paused = False
         self._pause_reason = ''
         self._init_error = ''  # Last init error for /debug
+        # Cached real balance (refreshed every 30s to avoid RPC spam)
+        self._cached_real_balance: Optional[float] = None
+        self._last_balance_check: float = 0.0
 
     async def init(self):
         """Initialize CLOB client with credentials.
@@ -160,6 +164,8 @@ class LiveTrader:
             # Step 5: Check actual balance
             real_balance = await self.fetch_balance()
             if real_balance is not None:
+                self._cached_real_balance = real_balance
+                self._last_balance_check = time.time()
                 if real_balance < 0.50:
                     print(f"\n{'='*60}", flush=True)
                     print(f"⚠️  WARNING: Polymarket balance is ${real_balance:.2f}", flush=True)
@@ -173,6 +179,9 @@ class LiveTrader:
                 else:
                     print(f"💰 Polymarket balance: ${real_balance:.2f}", flush=True)
                     self.balance_mgr.update_balance(real_balance)
+
+            # Step 6: Check USDC allowance
+            await self._check_allowance()
 
             self._initialized = True
             print(f"✅ Live trader initialized successfully", flush=True)
@@ -287,6 +296,37 @@ class LiveTrader:
 
         return None
 
+    async def _get_cached_balance(self) -> Optional[float]:
+        """Get real USDC balance, refreshing at most every 30 seconds."""
+        now = time.time()
+        if now - self._last_balance_check > 30:
+            real = await self.fetch_balance()
+            if real is not None:
+                self._cached_real_balance = real
+                self.balance_mgr.update_balance(real)
+            self._last_balance_check = now
+        return self._cached_real_balance
+
+    async def _check_allowance(self):
+        """Check if USDC allowance is sufficient for trading."""
+        try:
+            bal_resp = self.clob_client.get_balance_allowance()
+            if bal_resp:
+                allowance_raw = bal_resp.get('allowance', None)
+                if allowance_raw is not None:
+                    allowance = float(allowance_raw)
+                    if allowance > 1_000_000:
+                        allowance = allowance / 1e6
+                    if allowance < 1.0:
+                        print(f"⚠️ USDC allowance too low (${allowance:.2f}) — need to approve CLOB contract", flush=True)
+                        print(f"  Visit https://polymarket.com and place a manual trade first to set allowance", flush=True)
+                        self._trading_paused = True
+                        self._pause_reason = f'USDC allowance too low (${allowance:.2f})'
+                    else:
+                        print(f"✅ USDC allowance: ${allowance:.2f}", flush=True)
+        except Exception as e:
+            print(f"⚠️ Allowance check failed (non-fatal): {e}", flush=True)
+
     async def execute_signal(self, signal: TradeSignal) -> Optional[Dict]:
         """Execute a trade signal by placing a LIMIT order on the CLOB."""
         if not self.is_ready:
@@ -316,6 +356,7 @@ class LiveTrader:
         
         Uses per-leg prices from strategy metadata when available.
         Falls back to splitting entry_price for simple straddles.
+        Pre-validates that real balance can cover BOTH legs before placing either.
         """
         tokens = signal.token_id.split('|')
         if len(tokens) != 2:
@@ -324,6 +365,17 @@ class LiveTrader:
 
         meta = signal.metadata or {}
         half_size = max(Config.POLYMARKET_MIN_ORDER_SIZE, total_size / 2)
+
+        # ── PRE-VALIDATION: Ensure real balance can cover BOTH legs ──
+        needed = half_size * 2
+        real_bal = await self._get_cached_balance()
+        if real_bal is not None and needed > real_bal:
+            print(f"⚠️ Skip dual-leg: need ${needed:.2f} but only ${real_bal:.2f} available", flush=True)
+            return None
+
+        if not self.balance_mgr.can_afford_dual_leg():
+            print(f"⚠️ Skip dual-leg: insufficient tradeable balance for 2× ${Config.POLYMARKET_MIN_ORDER_SIZE:.0f} legs", flush=True)
+            return None
 
         # Extract per-leg prices from strategy metadata
         if meta.get('type') == 'cross_timeframe_arb':
@@ -395,7 +447,13 @@ class LiveTrader:
         return max(0.0, min(self.BASE_TAKER_FEE_RATE, fee))
 
     async def _place_limit_buy(self, signal: TradeSignal, size: float) -> Optional[Dict]:
-        """Place a limit buy order on the CLOB."""
+        """Place a limit buy order on the CLOB.
+        
+        Key fixes applied:
+        - Uses math.ceil to ensure price × shares >= $1.00 (Polymarket minimum)
+        - Checks real USDC balance before placing
+        - Auto-retries with bumped shares on 'invalid amount' errors
+        """
         try:
             from py_clob_client.clob_types import OrderArgs, OrderType
             from py_clob_client.order_builder.constants import BUY
@@ -407,26 +465,40 @@ class LiveTrader:
             trade_fee = self._get_dynamic_fee_rate(price)
             self.TAKER_FEE_RATE = trade_fee  # Update for PnL calcs
 
-            shares = round(size / price, 2)
+            # ── FIX: Ensure price × shares >= $1.00 (Polymarket minimum) ──
+            # Previously: round(size / price, 2) could produce $0.9984 < $1
+            # Now: calculate minimum shares needed, then round UP
+            min_shares_for_minimum = math.ceil(Config.POLYMARKET_MIN_ORDER_SIZE / price * 100) / 100
+            shares = max(min_shares_for_minimum, round(size / price, 2))
+
+            # Double-check: verify order_amount >= $1.00
+            order_amount = round(price * shares, 6)
+            if order_amount < Config.POLYMARKET_MIN_ORDER_SIZE:
+                # Bump shares by smallest increment until we meet minimum
+                shares = math.ceil(Config.POLYMARKET_MIN_ORDER_SIZE / price * 100) / 100
+                if shares * price < Config.POLYMARKET_MIN_ORDER_SIZE:
+                    shares = math.ceil(Config.POLYMARKET_MIN_ORDER_SIZE / price)
+                order_amount = round(price * shares, 6)
+
+            actual_cost = order_amount  # What CLOB will charge us
+
             if shares < 1:
                 return None  # Minimum ~1 share
+
+            # ── FIX: Check real balance BEFORE placing order ──
+            real_bal = await self._get_cached_balance()
+            if real_bal is not None and actual_cost > real_bal:
+                print(f"⚠️ Skip: order ${actual_cost:.2f} > real balance ${real_bal:.2f}", flush=True)
+                return None
 
             trade_id = str(uuid.uuid4())[:8]
             now = datetime.now().isoformat()
 
             print(f">> PLACING ORDER: {signal.coin} {signal.direction} | "
-                  f"${size:.2f} @ ${price:.3f} ({shares:.1f} shares) "
+                  f"${actual_cost:.2f} @ ${price:.3f} ({shares:.1f} shares) "
                   f"[fee~{trade_fee*100:.2f}%]", flush=True)
 
-            order_args = OrderArgs(
-                price=price,
-                size=shares,
-                side=BUY,
-                token_id=signal.token_id,
-            )
-
-            signed_order = self.clob_client.create_order(order_args)
-            resp = self.clob_client.post_order(signed_order, OrderType.GTC)
+            resp = await self._submit_order(signal.token_id, price, shares, BUY)
 
             if not resp or resp.get('status') == 'error':
                 error_msg = resp.get('errorMsg', 'Unknown error') if resp else 'No response'
@@ -447,7 +519,7 @@ class LiveTrader:
                 'token_id': signal.token_id,
                 'entry_price': price,
                 'exit_price': None,
-                'size_usd': size,
+                'size_usd': actual_cost,
                 'shares': shares,
                 'pnl': None,
                 'pnl_pct': None,
@@ -465,7 +537,11 @@ class LiveTrader:
 
             self.pending_orders[trade_id] = trade
             self.balance_mgr.open_positions += 1
-            self.balance_mgr.update_balance(self.balance_mgr.balance - size)
+            self.balance_mgr.update_balance(self.balance_mgr.balance - actual_cost)
+
+            # Also update cached real balance
+            if self._cached_real_balance is not None:
+                self._cached_real_balance = max(0, self._cached_real_balance - actual_cost)
 
             await self.db.save_trade(trade)
             self._consecutive_failures = 0  # Reset on success
@@ -475,9 +551,60 @@ class LiveTrader:
             error_str = str(e).lower()
             print(f"❌ Order error: {e}", flush=True)
 
+            # ── FIX: Auto-retry on 'invalid amount' with bumped shares ──
+            if 'invalid amount' in error_str and 'min size' in error_str:
+                try:
+                    retry_shares = math.ceil(shares)
+                    if retry_shares > shares:
+                        print(f"🔄 Retrying with {retry_shares} shares (bumped from {shares:.2f})", flush=True)
+                        resp = await self._submit_order(signal.token_id, price, retry_shares, BUY)
+                        if resp and resp.get('status') != 'error':
+                            order_id = resp.get('orderID', resp.get('id', str(uuid.uuid4())[:8]))
+                            actual_cost = round(price * retry_shares, 6)
+                            print(f"✅ RETRY ORDER PLACED: {order_id} (${actual_cost:.2f})", flush=True)
+                            trade_id = str(uuid.uuid4())[:8]
+                            trade = {
+                                'id': trade_id,
+                                'order_id': order_id,
+                                'market_id': signal.market_id,
+                                'coin': signal.coin,
+                                'timeframe': signal.timeframe,
+                                'strategy': signal.strategy,
+                                'direction': signal.direction,
+                                'token_id': signal.token_id,
+                                'entry_price': price,
+                                'exit_price': None,
+                                'size_usd': actual_cost,
+                                'shares': retry_shares,
+                                'pnl': None,
+                                'pnl_pct': None,
+                                'confidence': signal.confidence,
+                                'entry_time': datetime.now().isoformat(),
+                                'exit_time': None,
+                                'exit_reason': None,
+                                'status': 'pending',
+                                'rationale': signal.rationale,
+                                'metadata': signal.metadata,
+                                'placed_at': time.time(),
+                                'fee_rate': self.TAKER_FEE_RATE,
+                                '_live': True,
+                            }
+                            self.pending_orders[trade_id] = trade
+                            self.balance_mgr.open_positions += 1
+                            self.balance_mgr.update_balance(self.balance_mgr.balance - actual_cost)
+                            if self._cached_real_balance is not None:
+                                self._cached_real_balance = max(0, self._cached_real_balance - actual_cost)
+                            await self.db.save_trade(trade)
+                            self._consecutive_failures = 0
+                            return trade
+                except Exception as retry_err:
+                    print(f"❌ Retry also failed: {retry_err}", flush=True)
+
             # Detect balance/allowance errors and stop spamming
             if 'balance' in error_str or 'allowance' in error_str:
                 self._consecutive_failures += 1
+                # Refresh real balance on balance errors
+                self._last_balance_check = 0  # Force refresh next time
                 if self._consecutive_failures >= 5:
                     self._trading_paused = True
                     self._pause_reason = 'Not enough balance/allowance'
@@ -488,6 +615,18 @@ class LiveTrader:
                     print(f"{'='*60}\n", flush=True)
 
             return None
+
+    async def _submit_order(self, token_id: str, price: float, shares: float, side) -> Optional[Dict]:
+        """Submit a signed order to the CLOB. Reusable for retries."""
+        from py_clob_client.clob_types import OrderArgs, OrderType
+        order_args = OrderArgs(
+            price=price,
+            size=shares,
+            side=side,
+            token_id=token_id,
+        )
+        signed_order = self.clob_client.create_order(order_args)
+        return self.clob_client.post_order(signed_order, OrderType.GTC)
 
     async def check_pending_orders(self):
         """Check if pending orders have been filled, partially filled, or need cancellation."""
