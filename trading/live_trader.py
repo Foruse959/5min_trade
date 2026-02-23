@@ -888,12 +888,30 @@ class LiveTrader:
 
         return 'hold'
 
+    async def _ensure_conditional_allowance(self, token_id: str):
+        """Set conditional token allowance before selling.
+        
+        Proxy wallets (sig_type=2) need explicit approval for the exchange
+        contract to transfer outcome tokens when placing sell orders.
+        """
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL,
+                token_id=token_id,
+                signature_type=self._sig_type,
+            )
+            self.clob_client.update_balance_allowance(params)
+        except Exception as e:
+            print(f"⚠️ Conditional allowance update failed (non-fatal): {e}", flush=True)
+
     async def _close_position(self, trade_id: str, exit_price: float,
                               pnl: float, reason: str) -> bool:
         """Close a position by placing a sell order.
         
         Uses GTC limit sell at current price (acts as aggressive limit order).
         Falls back to a slightly lower price if first attempt fails.
+        Detects expired markets and auto-settles instead of retrying.
         """
         pos = self.positions.get(trade_id)
         if not pos:
@@ -912,6 +930,9 @@ class LiveTrader:
 
             print(f"📤 SELL ORDER: {pos['coin']} {pos['direction']} | "
                   f"{shares:.1f} shares @ ${sell_price:.3f} [{reason}]", flush=True)
+
+            # Set conditional token allowance before selling (required for proxy wallets)
+            await self._ensure_conditional_allowance(pos['token_id'])
 
             # Attempt 1: Limit sell at current price (GTC)
             sell_args = OrderArgs(
@@ -949,6 +970,18 @@ class LiveTrader:
             print(f"❌ Both sell attempts failed: {error_msg}", flush=True)
 
         except Exception as e:
+            error_str = str(e).lower()
+
+            # ── Detect expired/resolved market ──
+            # After a 5m market closes, the orderbook is deleted.
+            # Don't retry — let Polymarket auto-settle and pay out.
+            if 'does not exist' in error_str or 'orderbook' in error_str:
+                print(f"⏰ Market expired/resolved — auto-settling {pos['coin']} {pos['direction']}", flush=True)
+                # For expired markets: if we held a winning position, we get $1/share.
+                # If losing, we get $0. Use last known price as best estimate.
+                self._finalize_close(trade_id, exit_price, pnl, 'market_settled')
+                return True
+
             print(f"❌ Sell error: {e}", flush=True)
 
         return False
