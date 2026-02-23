@@ -249,7 +249,6 @@ class BinanceFeed:
         self._on_price: Optional[Callable] = None
         self._price_history: Dict[str, deque] = {}
         self._rest_endpoint: Optional[str] = None
-        self._ws_failed = False
         self._session = requests.Session()
         self._session.headers.update({
             'User-Agent': '5min-trade-bot/1.0',
@@ -264,34 +263,76 @@ class BinanceFeed:
         self._on_price = callback
 
     async def run(self, coins: List[str] = None):
-        """Stream prices — tries WS first, falls back to REST polling."""
+        """Stream prices — WS with auto-reconnect + REST fallback.
+        
+        Strategy:
+        - Try WS first (fastest, real-time)
+        - On disconnect: retry WS with exponential backoff (3s→5s→10s→30s cap)
+        - After 3 consecutive WS failures: switch to REST polling
+        - Every 5 min on REST: retry WS (it may come back)
+        - REST runs during WS gaps so trades ALWAYS have price data
+        """
         coins = coins or Config.ENABLED_COINS
         self._running = True
+        self._coins = coins
 
         # Initialize price history
         for coin in coins:
             if coin not in self._price_history:
                 self._price_history[coin] = deque(maxlen=120)
 
-        # Try WebSocket first
-        if not self._ws_failed:
-            try:
-                await asyncio.wait_for(self._run_ws(coins), timeout=10)
-            except (asyncio.TimeoutError, Exception) as e:
-                print(f"⚠️ Binance WS unavailable ({e}), switching to REST API", flush=True)
-                self._ws_failed = True
+        ws_failures = 0
+        max_ws_retries = 3  # Switch to REST after 3 consecutive WS failures
+        backoff = 3  # Start with 3s retry delay
 
-        # Fall back to REST API polling
-        if self._ws_failed and self._running:
-            await self._run_rest(coins)
+        while self._running:
+            # ── Try WebSocket ──
+            if ws_failures < max_ws_retries:
+                try:
+                    await self._run_ws(coins)
+                    # If _run_ws returns normally (not exception), connection closed cleanly
+                    ws_failures = 0
+                    backoff = 3
+                except websockets.ConnectionClosed:
+                    ws_failures += 1
+                    print(f"⚠️ Binance WS disconnected ({ws_failures}/{max_ws_retries}), "
+                          f"reconnecting in {backoff}s...", flush=True)
+                    await asyncio.sleep(backoff)
+                    backoff = min(30, backoff + 2)  # Cap at 30s
+                except Exception as e:
+                    ws_failures += 1
+                    print(f"⚠️ Binance WS error ({ws_failures}/{max_ws_retries}): {e}", flush=True)
+                    await asyncio.sleep(backoff)
+                    backoff = min(30, backoff + 2)
+                continue
+
+            # ── REST fallback (runs for 5 min, then retries WS) ──
+            print(f"📡 Binance: switching to REST polling (WS failed {ws_failures}x)", flush=True)
+            try:
+                await asyncio.wait_for(self._run_rest(coins), timeout=300)  # 5 min
+            except asyncio.TimeoutError:
+                pass  # Normal — timeout means it's time to retry WS
+            except Exception as e:
+                print(f"⚠️ Binance REST error: {e}", flush=True)
+                await asyncio.sleep(5)
+
+            # Reset WS failure counter to retry WS
+            ws_failures = 0
+            backoff = 3
+            print(f"🔄 Retrying Binance WS...", flush=True)
 
     async def _run_ws(self, coins: List[str]):
-        """Try WebSocket connection."""
+        """WebSocket connection with auto-reconnect on disconnect."""
         symbols = [Config.BINANCE_SYMBOLS.get(c, f'{c.lower()}usdt') for c in coins]
         streams = '/'.join(f"{s}@trade" for s in symbols)
         url = f"{Config.BINANCE_WS_URL}/{streams}"
 
-        async with websockets.connect(url) as ws:
+        async with websockets.connect(
+            url,
+            ping_interval=20,
+            ping_timeout=60,
+            close_timeout=10,
+        ) as ws:
             print(f"🔌 Binance WS connected ({', '.join(coins)})", flush=True)
 
             async for message in ws:
