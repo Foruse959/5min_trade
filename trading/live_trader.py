@@ -572,25 +572,19 @@ class LiveTrader:
             trade_fee = self._get_dynamic_fee_rate(price)
             self.TAKER_FEE_RATE = trade_fee  # Update for PnL calcs
 
-            # ── FIX: Ensure price × shares >= $1.00 (Polymarket minimum) ──
-            # Previously: round(size / price, 2) could produce $0.9984 < $1
-            # Now: calculate minimum shares needed, then round UP
-            min_shares_for_minimum = math.ceil(Config.POLYMARKET_MIN_ORDER_SIZE / price * 100) / 100
-            shares = max(min_shares_for_minimum, round(size / price, 2))
+            # ── Polymarket minimum: 5 shares AND $1.00 order value ──
+            MIN_SHARES = 5  # Polymarket CLOB minimum shares per order
+            raw_shares = round(size / price, 2)
+            shares = max(MIN_SHARES, raw_shares)
 
-            # Double-check: verify order_amount >= $1.00
+            # Ensure order_amount >= $1.00
             order_amount = round(price * shares, 6)
             if order_amount < Config.POLYMARKET_MIN_ORDER_SIZE:
-                # Bump shares by smallest increment until we meet minimum
-                shares = math.ceil(Config.POLYMARKET_MIN_ORDER_SIZE / price * 100) / 100
-                if shares * price < Config.POLYMARKET_MIN_ORDER_SIZE:
-                    shares = math.ceil(Config.POLYMARKET_MIN_ORDER_SIZE / price)
+                shares = math.ceil(Config.POLYMARKET_MIN_ORDER_SIZE / price)
+                shares = max(MIN_SHARES, shares)
                 order_amount = round(price * shares, 6)
 
             actual_cost = order_amount  # What CLOB will charge us
-
-            if shares < 1:
-                return None  # Minimum ~1 share
 
             # ── FIX: Check real balance BEFORE placing order ──
             real_bal = await self._get_cached_balance()
@@ -658,10 +652,18 @@ class LiveTrader:
             error_str = str(e).lower()
             print(f"❌ Order error: {e}", flush=True)
 
-            # ── FIX: Auto-retry on 'invalid amount' with bumped shares ──
-            if 'invalid amount' in error_str and 'min size' in error_str:
+            # ── Auto-retry on minimum size errors ──
+            if ('lower than the minimum' in error_str or
+                    ('invalid' in error_str and 'size' in error_str)):
                 try:
-                    retry_shares = math.ceil(shares)
+                    # Extract actual minimum from error (e.g., "minimum: 5" → 5)
+                    import re
+                    min_match = re.search(r'minimum[:\s]+(\d+)', error_str)
+                    if min_match:
+                        retry_shares = max(int(min_match.group(1)), math.ceil(shares))
+                    else:
+                        retry_shares = max(5, math.ceil(shares))
+                    
                     if retry_shares > shares:
                         print(f"🔄 Retrying with {retry_shares} shares (bumped from {shares:.2f})", flush=True)
                         resp = await self._submit_order(signal.token_id, price, retry_shares, BUY)
